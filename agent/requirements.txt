@@ -1,0 +1,19 @@
+# Official Model Context Protocol SDK for the local Windows tool server.
+mcp==2.3.0
+
+# Lightweight HTTP client for talking to the llamafile OpenAI-compatible API.
+httpx==0.28.1
+
+# Process listing, RAM/CPU information, and other basic system stats.
+psutil==7.2.2
+
+# Windows API access for active-window detection and clipboard support.
+pywin32==312
+
+# Optional offline voice input:
+# SpeechRecognition handles microphone capture; pocketsphinx provides offline STT;
+# PyAudio provides Windows microphone access for SpeechRecognition.
+SpeechRecognition==3.14.3
+pocketsphinx==5.0.4
+PyAudio==0.2.14
+vosk==0.3.45

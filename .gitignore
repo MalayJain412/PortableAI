@@ -1,0 +1,48 @@
+cache/
+logs/
+models/
+runtime/
+System Volume Information/
+__pycache__/
+
+# Python virtual environments
+venv/
+.venv/
+**/venv/
+**/.venv/
+
+# Python generated files
+*.py[cod]
+*.pyd
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Build/package output
+build/
+dist/
+*.whl
+
+# Environment variables and local secrets
+.env
+.env.*
+!.env.example
+
+# IDE/editor files
+.vscode/
+.idea/
+*.code-workspace
+
+# OS files
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Temporary/editor files
+*.tmp
+*.bak
+*.swp
+*.swo
