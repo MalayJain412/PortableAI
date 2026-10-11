@@ -1,10 +1,7 @@
 from __future__ import annotations
 
-import asyncio
-import difflib
 import json
-import re
-from urllib.parse import quote_plus
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -45,1068 +42,554 @@ Available tools:
 - clipboard_write: {"text":"text to copy"}
 
 Rules:
-- First identify the user's intent.
-- If there is no clear intent to use a tool, answer naturally.
-- If there is a clear tool intent, compare it with the available tools.
-- If an available tool completely matches the intent, return tools.
-- If an available tool slightly matches the intent, return confirm with the proposed tool call.
-- Split compound requests into action buckets. Each requested app, URL, or operation should become its own action.
-- For "close Chrome and WhatsApp", return two close_application actions: one for chrome and one for whatsapp.
-- For "list Chrome and WhatsApp windows", return two list_application_windows actions.
-- Preserve the user's requested order when creating actions.
-- Use tools for requests to open apps, open URLs, YouTube searches, inspect processes, inspect system info, inspect active window, list app windows, or use clipboard.
-- Use close_application for requests to close allowlisted applications or their visible windows.
-- Use list_application_windows for requests to list, show, check, or inspect visible windows for an allowlisted application.
-- For one-shot requests to open Notepad and write text, use open_notepad_with_text.
-- For multi-step Notepad work, use notepad_open, notepad_type, notepad_save, and notepad_close.
-- notepad_type appends text to the agent-managed Notepad note.
-- notepad_save reports the saved file path because the managed note is already disk-backed.
-- notepad_save_as saves the managed note under a simple filename.
-- notepad_close only closes Notepad windows launched by this agent.
-- If the user has a minor typo but the intent is clear, infer the intended available tool.
-- Never invent tool names.
-- Never request cmd, powershell, python, shell, keyboard, mouse, files, registry, services, or startup changes.
-- For "Open Chrome and go to Google", request open_application then open_url.
-- Use at most 5 actions."""
+- A tool handles one application, URL, or operation. Call it once for every requested target.
+- Preserve the user's requested order. The host executes your calls sequentially.
+- "open WhatsApp and Chrome" requires open_application for whatsapp and then chrome.
+- "open Chrome and Notepad" requires open_application for chrome and then notepad.
+- "close Chrome and Notepad" requires close_application for chrome and then notepad.
+- "open YouTube on Chrome" requires open_application for chrome and open_url for https://youtube.com.
+- "open youtube.com on chrome" has the same two actions.
+- Opening YouTube home is URL navigation, not a YouTube content search.
+- Use youtube_search_open only for a specific video, playlist, channel, or content search.
+- For a one-shot request to open Notepad with text, use open_notepad_with_text.
+- For Notepad requests that also save or close, use notepad_open with the text, then notepad_save_as or notepad_save, then notepad_close.
+- Treat "note pad" as the clear spelling variant "notepad".
+- Only call tools that are provided. Never invent a tool or an argument.
+- If an application is unsupported, say which applications are allowed. Do not map it to an unrelated application.
+- If the meaning is genuinely ambiguous, ask one short confirmation question and do not call any tool yet.
+- For ordinary conversation with no tool intent, answer naturally and concisely.
+- Never claim an action succeeded before receiving its tool result.
+"""
+
+SYSTEM_STRUCTURED_PLANNER = """You are the action planner for Portable AI, a local offline Windows assistant.
+Return only data matching the supplied JSON schema.
+
+Build one ordered action for every task in the user's message. Never silently drop a coordinated item.
+Available tool names are:
+open_application, close_application, list_application_windows, notepad_open,
+open_notepad_with_text, notepad_type, notepad_save, notepad_save_as,
+notepad_close, open_url, youtube_search_open, list_processes,
+system_information, active_window, clipboard_read, clipboard_write.
+
+Canonical applications are: notepad, calculator, calc, chrome, whatsapp.
+
+Required examples:
+- open WhatsApp and Chrome -> two open_application actions in that order.
+- open Chrome and Notepad -> two open_application actions in that order.
+- close Chrome and Notepad -> two close_application actions in that order.
+- open YouTube on Chrome -> open_application(chrome), then open_url(https://youtube.com).
+- open youtube.com on chrome -> open_application(chrome), then open_url(https://youtube.com).
+- find the Makemore playlist on YouTube -> youtube_search_open with a specific search query.
+
+Opening YouTube home is navigation and must not use youtube_search_open. A specific video, playlist, or channel request must use youtube_search_open.
+For a one-shot Notepad text request use open_notepad_with_text. If save or close is also requested, use notepad_open with the text followed by the requested save and close actions.
+Treat "note pad" as the clear spelling variant "notepad". For a genuinely uncertain match, return type "confirm", include the proposed actions, and ask a short question. For unsupported applications, return type "answer" and explain the allowlist. For normal conversation, return type "answer" with a concise natural response.
+Never invent tools or arguments. Use no more than eight actions.
+"""
+
+
+class PlannedAction(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    tool: str = Field(description="Exact registered LangChain tool name.")
+    arguments: dict[str, Any] = Field(default_factory=dict)
+
+
+class ToolPlan(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["answer", "tools", "confirm"]
+    content: str = ""
+    actions: list[PlannedAction] = Field(default_factory=list, max_length=MAX_ACTIONS)
+
+    @model_validator(mode="after")
+    def validate_plan_shape(self) -> "ToolPlan":
+        if self.type in {"tools", "confirm"} and not self.actions:
+            raise ValueError(f"A {self.type} plan must contain at least one action.")
+        if self.type == "answer" and self.actions:
+            raise ValueError("An answer plan cannot contain tool actions.")
+        return self
+
+
+class ProbeInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    value: Literal["ready"]
+
+
+@tool(args_schema=ProbeInput)
+def portable_ai_tool_probe(value: Literal["ready"]) -> str:
+    """Capability probe. Call this tool with the exact value ready when explicitly requested."""
+    return value
 
 
 @dataclass(frozen=True)
-class ChatTurnResult:
-    content: str
-    metrics: LLMResult | None
+class PendingConfirmation:
+    user_text: str
+    actions: list[PlannedAction]
+
+
+class ConversationState(TypedDict):
+    messages: Annotated[list[BaseMessage], add_messages]
 
 
 class PortableAgent:
-    def __init__(self, llm: LlamafileClient | None = None) -> None:
+    def __init__(
+        self,
+        llm: LlamafileClient | None = None,
+        *,
+        chat_model: Any | None = None,
+        tools: list[BaseTool] | None = None,
+        tool_calling_supported: bool | None = None,
+    ) -> None:
         self.llm = llm or LlamafileClient()
-        self.server = create_server()
-        self.history: list[Message] = []
-        self.last_youtube_query: str | None = None
-        self.pending_confirmation: dict[str, Any] | None = None
+        self.chat_model = chat_model or ChatOpenAI(
+            model=self.llm.model,
+            base_url=f"{self.llm.base_url}/v1",
+            api_key="portable-ai-local",
+            temperature=0,
+            max_tokens=480,
+            timeout=120,
+            max_retries=1,
+        )
+        self.tools = list(tools or LANGCHAIN_TOOLS)
+        self.tool_registry = {item.name: item for item in self.tools}
+        self._memory = InMemorySaver()
+        self._memory_graph = build_memory_graph(self._memory)
+        self._memory_config = {"configurable": {"thread_id": "portable-ai-session"}}
+        self.pending_confirmation: PendingConfirmation | None = None
+        self._tool_calling_supported = tool_calling_supported
+        self._bound_model: Any | None = None
+        self._planner_parser = PydanticOutputParser(pydantic_object=ToolPlan)
+
+    async def initialize(self) -> bool:
+        """Probe the local model once and select native tool calling or structured planning."""
+        return await self._supports_native_tool_calls()
 
     async def tool_names(self) -> list[str]:
-        tools = await self.server.list_tools()
-        return [tool.name for tool in tools]
+        return list(self.tool_registry)
+
+    def clear_history(self) -> None:
+        self._memory.delete_thread("portable-ai-session")
+        self.pending_confirmation = None
 
     async def handle(self, user_text: str, on_token: TokenCallback | None = None) -> LLMResult:
-        pending_result = await self._handle_pending_confirmation(user_text, on_token)
+        started_at = time.perf_counter()
+        pending_result = await self._handle_pending_confirmation(user_text, started_at)
         if pending_result is not None:
             return pending_result
 
-        obvious = obvious_safe_tool_intent(user_text, self.last_youtube_query)
-        if obvious is not None and obvious.get("type") != "confirm":
-            if obvious.get("type") == "blocked":
-                return static_result(str(obvious["content"]))
-            remember_youtube_query = get_youtube_query_from_decision(obvious)
-            if remember_youtube_query:
-                self.last_youtube_query = remember_youtube_query
-            return await self._handle_tools(user_text, obvious, on_token)
+        if await self._supports_native_tool_calls():
+            native_result = await self._handle_native(user_text, on_token, started_at)
+            if native_result is not None:
+                return native_result
 
-        decision = self._decide(user_text)
-        repair = notepad_repair_decision(user_text, decision)
-        if repair is not None:
-            decision = repair
-        if decision.get("type") == "confirm":
-            return self._set_confirmation(user_text, decision)
+        return await self._handle_structured(user_text, on_token, started_at)
 
-        if decision.get("type") == "tools":
-            remember_youtube_query = get_youtube_query_from_decision(decision)
-            if remember_youtube_query:
-                self.last_youtube_query = remember_youtube_query
-            return await self._handle_tools(user_text, decision, on_token)
+    async def _supports_native_tool_calls(self) -> bool:
+        if self._tool_calling_supported is not None:
+            return self._tool_calling_supported
 
-        fallback = obvious
-        if fallback is None:
-            fallback = obvious_safe_tool_intent(user_text, self.last_youtube_query)
-        if fallback is not None:
-            if fallback.get("type") == "blocked":
-                return static_result(str(fallback["content"]))
-            if fallback.get("type") == "confirm":
-                return self._set_confirmation(user_text, fallback)
-            remember_youtube_query = get_youtube_query_from_decision(fallback)
-            if remember_youtube_query:
-                self.last_youtube_query = remember_youtube_query
-            return await self._handle_tools(user_text, fallback, on_token)
+        try:
+            probe_model = self.chat_model.bind_tools([portable_ai_tool_probe])
+            response = await probe_model.ainvoke(
+                [
+                    SystemMessage(content="You are testing OpenAI-compatible tool calling."),
+                    HumanMessage(content="Call portable_ai_tool_probe now with value ready. Do not answer in text."),
+                ]
+            )
+            calls = getattr(response, "tool_calls", None) or []
+            self._tool_calling_supported = any(
+                call.get("name") == portable_ai_tool_probe.name and call.get("args", {}).get("value") == "ready"
+                for call in calls
+                if isinstance(call, dict)
+            )
+        except Exception:
+            self._tool_calling_supported = False
 
-        if decision.get("type") == "answer" and decision.get("content"):
-            return self._chat(user_text, on_token)
+        if self._tool_calling_supported:
+            self._bound_model = self.chat_model.bind_tools(self.tools)
+        return bool(self._tool_calling_supported)
 
-        return self._chat(user_text, on_token)
+    async def _handle_native(
+        self,
+        user_text: str,
+        on_token: TokenCallback | None,
+        started_at: float,
+    ) -> LLMResult | None:
+        model = self._bound_model or self.chat_model.bind_tools(self.tools)
+        messages = [SystemMessage(content=SYSTEM_TOOL_AGENT), *self._recent_messages(), HumanMessage(content=user_text)]
+        validation_feedback = ""
 
-    def _decide(self, user_text: str) -> dict[str, Any]:
-        messages: list[Message] = [
-            {"role": "system", "content": SYSTEM_ROUTER},
-            {"role": "user", "content": user_text},
-        ]
         for _ in range(2):
-            result = self.llm.chat(messages, max_tokens=220, temperature=0.0, stream=False)
-            parsed = parse_json_object(result.content)
-            if isinstance(parsed, dict) and parsed.get("type") in {"answer", "tools", "confirm"}:
-                return parsed
-            messages.append({"role": "assistant", "content": result.content})
-            messages.append({"role": "user", "content": "Return only valid JSON using the required schema."})
-        return {"type": "answer", "content": ""}
+            attempt_messages = list(messages)
+            if validation_feedback:
+                attempt_messages.append(
+                    HumanMessage(
+                        content=(
+                            "Your proposed tool calls were invalid. Correct every issue and return a complete replacement "
+                            f"set of tool calls. Validation errors: {validation_feedback}"
+                        )
+                    )
+                )
+            response = await model.ainvoke(attempt_messages)
+            calls = getattr(response, "tool_calls", None) or []
+            if calls:
+                actions = [
+                    PlannedAction(tool=str(call.get("name", "")), arguments=call.get("args") or {})
+                    for call in calls
+                    if isinstance(call, dict)
+                ]
+                prepared, validation_feedback = self._validate_actions(actions)
+                if prepared is None:
+                    continue
+                return await self._execute_and_report(user_text, prepared, started_at)
+
+            content = message_text(response)
+            if content:
+                self._remember(user_text, content)
+                if on_token is not None:
+                    on_token(content)
+                return measured_result(content, started_at)
+            validation_feedback = "The response contained neither text nor valid tool calls."
+
+        return None
+
+    async def _handle_structured(
+        self,
+        user_text: str,
+        on_token: TokenCallback | None,
+        started_at: float,
+    ) -> LLMResult:
+        validation_feedback = ""
+        for _ in range(2):
+            plan = await self._create_structured_plan(user_text, validation_feedback)
+            if plan is None:
+                validation_feedback = "Return exactly one valid JSON object matching the supplied schema."
+                continue
+
+            if plan.type == "answer":
+                content = plan.content.strip()
+                if not content:
+                    break
+                self._remember(user_text, content)
+                if on_token is not None:
+                    on_token(content)
+                return measured_result(content, started_at)
+
+            prepared, validation_feedback = self._validate_actions(plan.actions)
+            if prepared is None:
+                continue
+
+            if plan.type == "confirm":
+                self.pending_confirmation = PendingConfirmation(user_text=user_text, actions=prepared)
+                content = plan.content.strip() or confirmation_prompt(prepared)
+                return measured_result(content, started_at)
+
+            return await self._execute_and_report(user_text, prepared, started_at)
+
+        return await self._stream_natural_answer(user_text, on_token, started_at)
+
+    async def _create_structured_plan(self, user_text: str, feedback: str) -> ToolPlan | None:
+        history_text = render_history(self._recent_messages())
+        messages: list[BaseMessage] = [
+            SystemMessage(
+                content=(
+                    f"{SYSTEM_STRUCTURED_PLANNER}\n\n"
+                    f"JSON schema instructions:\n{self._planner_parser.get_format_instructions()}"
+                )
+            ),
+        ]
+        if history_text:
+            messages.append(SystemMessage(content=f"Recent conversation:\n{history_text}"))
+        if feedback:
+            messages.append(SystemMessage(content=f"Correct these validation errors: {feedback}"))
+        messages.append(HumanMessage(content=user_text))
+
+        try:
+            response = await self.chat_model.ainvoke(messages)
+            return self._planner_parser.parse(message_text(response))
+        except (ValidationError, ValueError, json.JSONDecodeError, TypeError):
+            return None
+
+    def _validate_actions(
+        self,
+        actions: list[PlannedAction],
+    ) -> tuple[list[PlannedAction] | None, str]:
+        if not actions:
+            return None, "At least one tool action is required."
+        if len(actions) > MAX_ACTIONS:
+            return None, f"No more than {MAX_ACTIONS} actions are allowed."
+
+        prepared: list[PlannedAction] = []
+        errors: list[str] = []
+        for index, action in enumerate(actions, start=1):
+            selected_tool = self.tool_registry.get(action.tool)
+            if selected_tool is None:
+                errors.append(f"Action {index} uses unavailable tool {action.tool!r}.")
+                continue
+            try:
+                schema = selected_tool.get_input_schema()
+                validated = schema.model_validate(action.arguments)
+                arguments = validated.model_dump(exclude_none=False)
+            except Exception as exc:
+                errors.append(f"Action {index} ({action.tool}) has invalid arguments: {exc}")
+                continue
+            prepared.append(PlannedAction(tool=action.tool, arguments=arguments))
+
+        if errors:
+            return None, " ".join(errors)
+        return prepared, ""
+
+    async def _execute_and_report(
+        self,
+        user_text: str,
+        actions: list[PlannedAction],
+        started_at: float,
+    ) -> LLMResult:
+        results: list[dict[str, Any]] = []
+        for action in actions:
+            selected_tool = self.tool_registry[action.tool]
+            try:
+                output = await selected_tool.ainvoke(action.arguments)
+                output_ok = output.get("ok", True) if isinstance(output, dict) else True
+                results.append({"tool": action.tool, "ok": bool(output_ok), "result": output})
+            except Exception as exc:
+                results.append({"tool": action.tool, "ok": False, "error": str(exc)})
+
+        content = summarize_tool_results(results)
+        self._remember(user_text, content)
+        return measured_result(content, started_at)
 
     async def _handle_pending_confirmation(
         self,
         user_text: str,
-        on_token: TokenCallback | None,
+        started_at: float,
     ) -> LLMResult | None:
         pending = self.pending_confirmation
         if pending is None:
             return None
 
-        answer = parse_confirmation_answer(user_text)
+        answer = confirmation_answer(user_text)
         if answer is True:
             self.pending_confirmation = None
-            decision = pending.get("decision")
-            original_text = str(pending.get("user_text") or user_text)
-            if isinstance(decision, dict):
-                return await self._handle_tools(original_text, decision, on_token)
-            return static_result("I lost the pending action, so I did not run anything.")
-
+            return await self._execute_and_report(pending.user_text, pending.actions, started_at)
         if answer is False:
             self.pending_confirmation = None
-            return static_result("No problem. What would you like help with instead?")
+            return measured_result("No problem. I cancelled that action.", started_at)
 
         self.pending_confirmation = None
         return None
 
-    def _set_confirmation(self, user_text: str, decision: dict[str, Any]) -> LLMResult:
-        tool_decision = decision.get("decision")
-        content = decision.get("content")
-        if not isinstance(tool_decision, dict) or tool_decision.get("type") != "tools":
-            return static_result("I need a clearer command before I use a tool.")
-        if not isinstance(content, str) or not content.strip() or content.strip().lower() == "yes/no question":
-            content = confirmation_prompt_for_decision(tool_decision)
-        self.pending_confirmation = {"user_text": user_text, "decision": tool_decision}
-        return static_result(content.strip())
-
-    def _chat(self, user_text: str, on_token: TokenCallback | None) -> LLMResult:
-        messages = [{"role": "system", "content": SYSTEM_CHAT}, *self.history[-8:], {"role": "user", "content": user_text}]
-        result = self.llm.chat(messages, max_tokens=320, temperature=0.3, stream=True, on_token=on_token)
-        self._remember(user_text, result.content)
-        return result
-
-    async def _handle_tools(
+    async def _stream_natural_answer(
         self,
         user_text: str,
-        decision: dict[str, Any],
         on_token: TokenCallback | None,
+        started_at: float,
     ) -> LLMResult:
-        actions = decision.get("actions")
-        if not isinstance(actions, list):
-            return self._chat(user_text, on_token)
-
-        available = set(await self.tool_names())
-        results: list[dict[str, Any]] = []
-        for action in actions[:5]:
-            if not isinstance(action, dict):
-                continue
-            tool_name = action.get("tool")
-            arguments = action.get("arguments") or {}
-            if tool_name not in available or not isinstance(arguments, dict):
-                results.append({"tool": tool_name, "ok": False, "error": "Tool is not available or arguments are invalid."})
-                continue
-
-            try:
-                call_result = await self.server.call_tool(tool_name, arguments)
-                results.append(
-                    {
-                        "tool": tool_name,
-                        "ok": not call_result.is_error,
-                        "result": call_result.structured_content,
-                    }
-                )
-            except Exception as exc:
-                results.append({"tool": tool_name, "ok": False, "error": str(exc)})
-
-        deterministic = deterministic_tool_reply(results)
-        if deterministic is not None:
-            self._remember(user_text, deterministic)
-            return static_result(deterministic)
-
-        final_messages: list[Message] = [
-            {"role": "system", "content": SYSTEM_CHAT},
-            {
-                "role": "user",
-                "content": (
-                    "The user asked:\n"
-                    f"{user_text}\n\n"
-                    "Tool results as JSON:\n"
-                    f"{json.dumps(results, ensure_ascii=False)}\n\n"
-                    "If a tool result says ok=true, say that the action completed. "
-                    "Do not claim you lack permission for an action that already completed. "
-                    "Do not merely say data was retrieved; include the important details. "
-                    "For system_information, include Windows, CPU cores, total RAM, and available RAM. "
-                    "For list_processes, summarize the count and name a few visible processes. "
-                    "For clipboard_read, include the clipboard text unless it is empty. "
-                    "Reply to the user in one or two concise sentences."
-                ),
-            },
+        messages = [
+            SystemMessage(
+                content="You are Portable AI, a concise and honest local Windows assistant. Answer naturally."
+            ),
+            *self._recent_messages(),
+            HumanMessage(content=user_text),
         ]
-        result = self.llm.chat(final_messages, max_tokens=220, temperature=0.2, stream=True, on_token=on_token)
-        self._remember(user_text, result.content)
-        return result
+        chunks: list[str] = []
+        first_token_at: float | None = None
+        async for chunk in self.chat_model.astream(messages):
+            text = message_text(chunk)
+            if not text:
+                continue
+            if first_token_at is None:
+                first_token_at = time.perf_counter()
+            chunks.append(text)
+            if on_token is not None:
+                on_token(text)
+
+        content = "".join(chunks)
+        self._remember(user_text, content)
+        return measured_result(content, started_at, first_token_at)
+
+    def _recent_messages(self) -> list[BaseMessage]:
+        snapshot = self._memory_graph.get_state(self._memory_config)
+        messages = snapshot.values.get("messages", [])
+        return list(messages[-MAX_HISTORY_MESSAGES:])
 
     def _remember(self, user_text: str, assistant_text: str) -> None:
-        self.history.append({"role": "user", "content": user_text})
-        self.history.append({"role": "assistant", "content": assistant_text})
-        self.history = self.history[-12:]
+        self._memory_graph.invoke(
+            {"messages": [HumanMessage(content=user_text), AIMessage(content=assistant_text)]},
+            self._memory_config,
+        )
 
 
-def parse_json_object(text: str) -> dict[str, Any] | None:
-    cleaned = text.strip()
-    if cleaned.startswith("```"):
-        cleaned = cleaned.strip("`")
-        if cleaned.lower().startswith("json"):
-            cleaned = cleaned[4:].strip()
-
-    try:
-        value = json.loads(cleaned)
-        return value if isinstance(value, dict) else None
-    except json.JSONDecodeError:
-        pass
-
-    start = cleaned.find("{")
-    end = cleaned.rfind("}")
-    if start == -1 or end == -1 or end <= start:
-        return None
-    try:
-        value = json.loads(cleaned[start : end + 1])
-    except json.JSONDecodeError:
-        return None
-    return value if isinstance(value, dict) else None
+def build_memory_graph(checkpointer: InMemorySaver) -> Any:
+    builder = StateGraph(ConversationState)
+    builder.add_node("remember", lambda state: {})
+    builder.add_edge(START, "remember")
+    builder.add_edge("remember", END)
+    return builder.compile(checkpointer=checkpointer)
 
 
-def obvious_safe_tool_intent(user_text: str, last_youtube_query: str | None = None) -> dict[str, Any] | None:
-    text = user_text.strip()
-    lower = text.lower()
-    actions: list[dict[str, Any]] = []
-
-    notepad_command = parse_notepad_command(text)
-    if notepad_command is not None:
-        return notepad_command
-
-    notepad_text = parse_notepad_write(text)
-    if notepad_text is not None:
-        return {"type": "tools", "actions": [{"tool": "open_notepad_with_text", "arguments": {"text": notepad_text}}]}
-
-    fuzzy_notepad_write = parse_fuzzy_notepad_write_confirmation(text)
-    if fuzzy_notepad_write is not None:
-        return fuzzy_notepad_write
-
-    clipboard_write = parse_clipboard_write(text)
-    if clipboard_write is not None:
-        return {"type": "tools", "actions": [{"tool": "clipboard_write", "arguments": {"text": clipboard_write}}]}
-
-    if asks_capabilities(lower):
-        return {
-            "type": "blocked",
-            "content": (
-                "I can chat with the local Qwen model and use safe Windows tools: open Notepad, Calculator, "
-                "Chrome, or WhatsApp; list and close allowlisted app windows; open, type into, save, and close an agent-managed Notepad note; open http/https URLs; list running processes; show basic system information; "
-                "report the active window; and read or write clipboard text. I cannot run arbitrary shell, "
-                "PowerShell, Python, mouse, keyboard, file, registry, or browser automation commands yet."
-            ),
-        }
-
-    if "clipboard" in lower and any(word in lower for word in ("read", "show", "what", "paste")):
-        return {"type": "tools", "actions": [{"tool": "clipboard_read", "arguments": {}}]}
-
-    list_windows_apps = parse_list_application_windows(lower)
-    if list_windows_apps:
-        return {
-            "type": "tools",
-            "actions": [{"tool": "list_application_windows", "arguments": {"application": app}} for app in list_windows_apps],
-        }
-
-    close_apps = parse_close_application(lower)
-    if close_apps:
-        return {
-            "type": "tools",
-            "actions": [{"tool": "close_application", "arguments": {"application": app}} for app in close_apps],
-        }
-
-    youtube_query = parse_youtube_query(text, last_youtube_query)
-    if youtube_query is not None:
-        return {"type": "tools", "actions": [{"tool": "youtube_search_open", "arguments": {"query": youtube_query}}]}
-
-    app = parse_open_application(lower)
-    if app is not None:
-        actions.append({"tool": "open_application", "arguments": {"application": app}})
-    else:
-        fuzzy_open = parse_fuzzy_open_application_confirmation(text)
-        if fuzzy_open is not None:
-            return fuzzy_open
-
-    url = parse_open_url(text)
-    if url is not None:
-        actions.append({"tool": "open_url", "arguments": {"url": url}})
-
-    if actions:
-        return {"type": "tools", "actions": actions[:3]}
-
-    if looks_like_unsupported_open_request(text):
-        return {
-            "type": "blocked",
-            "content": (
-                "I can only open allowlisted apps right now: notepad, calculator, calc, chrome, and whatsapp. "
-                "That requested app is not in the allowlist yet."
-            ),
-        }
-
-    if any(phrase in lower for phrase in ("running processes", "running applications", "applications are currently running")):
-        return {"type": "tools", "actions": [{"tool": "list_processes", "arguments": {}}]}
-
-    if any(phrase in lower for phrase in ("system specs", "system information", "basic system", "computer specs")):
-        return {"type": "tools", "actions": [{"tool": "system_information", "arguments": {}}]}
-
-    if any(phrase in lower for phrase in ("active window", "current window", "window am i")):
-        return {"type": "tools", "actions": [{"tool": "active_window", "arguments": {}}]}
-
-    return None
-
-
-def notepad_repair_decision(user_text: str, decision: dict[str, Any]) -> dict[str, Any] | None:
-    if not isinstance(decision, dict) or decision.get("type") != "tools":
-        return None
-
-    fallback = parse_notepad_command(user_text)
-    if fallback is None or fallback.get("type") != "tools":
-        return None
-
-    fallback_tools = tool_names_from_decision(fallback)
-    if not fallback_tools or len(fallback_tools) <= 1:
-        return None
-
-    decision_tools = tool_names_from_decision(decision)
-    if not decision_tools:
-        return fallback
-
-    notepad_tools = {"notepad_open", "open_notepad_with_text", "notepad_type", "notepad_save", "notepad_save_as", "notepad_close"}
-    if any(tool in notepad_tools for tool in decision_tools) and not set(fallback_tools).issubset(set(decision_tools)):
-        return fallback
-    return None
-
-
-def tool_names_from_decision(decision: dict[str, Any]) -> list[str]:
-    actions = decision.get("actions")
-    if not isinstance(actions, list):
-        return []
-    return [str(action.get("tool")) for action in actions if isinstance(action, dict) and action.get("tool")]
-
-
-OPEN_APPLICATION_ALIASES: dict[str, tuple[str, ...]] = {
-    "notepad": ("notepad", "note pad"),
-    "calculator": ("calculator", "calc"),
-    "chrome": ("chrome", "google chrome"),
-    "whatsapp": ("whatsapp", "whats app"),
-}
-
-
-def parse_confirmation_answer(text: str) -> bool | None:
+def confirmation_answer(text: str) -> bool | None:
     normalized = " ".join(text.strip().lower().split())
-    if normalized in {"y", "yes", "yeah", "yep", "ok", "okay", "correct", "confirm", "do it", "go ahead", "run it"}:
+    if normalized in {"y", "yes", "yes please", "confirm", "proceed", "do it"}:
         return True
-    if normalized in {"n", "no", "nope", "cancel", "stop", "wrong", "do not", "don't", "dont"}:
+    if normalized in {"n", "no", "no thanks", "cancel", "stop", "do not"}:
         return False
     return None
 
 
-def confirmation_prompt_for_decision(decision: dict[str, Any]) -> str:
-    actions = decision.get("actions")
-    if isinstance(actions, list) and len(actions) == 1 and isinstance(actions[0], dict):
-        action = actions[0]
-        tool = action.get("tool")
-        arguments = action.get("arguments") or {}
-        if isinstance(arguments, dict):
-            app = arguments.get("application")
-            if isinstance(app, str) and app:
-                label = format_application_name(app)
-                if tool == "close_application":
-                    return f"Did you mean: close {label}? Reply yes to run it, or no to cancel."
-                if tool == "open_application":
-                    return f"Did you mean: open {label}? Reply yes to run it, or no to cancel."
-                if tool == "list_application_windows":
-                    return f"Did you mean: list visible {label} windows? Reply yes to run it, or no to cancel."
-    return "Did you mean this action? Reply yes to run it, or no to cancel."
+def confirmation_prompt(actions: list[PlannedAction]) -> str:
+    descriptions = [describe_action(action) for action in actions]
+    joined = ", then ".join(descriptions)
+    return f"Did you mean: {joined}? Reply yes to run it, or no to cancel."
 
 
-def deterministic_tool_reply(results: list[dict[str, Any]]) -> str | None:
+def describe_action(action: PlannedAction) -> str:
+    target = action.arguments.get("application") or action.arguments.get("url") or action.arguments.get("filename")
+    if target:
+        return f"{action.tool.replace('_', ' ')} {target}"
+    return action.tool.replace("_", " ")
+
+
+def summarize_tool_results(results: list[dict[str, Any]]) -> str:
     if not results:
-        return None
-
-    if all(item.get("tool") in {"open_application", "open_url"} for item in results):
-        failed = [item for item in results if not item.get("ok")]
-        if failed:
-            return "I could not complete that open request with the available tools."
-
-        apps = [
-            format_application_name(str((item.get("result") or {}).get("application")))
-            for item in results
-            if item.get("tool") == "open_application" and (item.get("result") or {}).get("application")
-        ]
-        urls = [
-            str((item.get("result") or {}).get("url"))
-            for item in results
-            if item.get("tool") == "open_url" and (item.get("result") or {}).get("url")
-        ]
-        if apps and urls:
-            return f"I opened {', '.join(apps)} and navigated to {', '.join(urls)}."
-        if apps:
-            return f"I opened {', '.join(apps)}."
-        if urls:
-            return f"I opened {', '.join(urls)}."
-
-    if all(item.get("tool") == "close_application" for item in results):
-        return deterministic_multi_close_application_reply(results)
-
-    if all(item.get("tool") == "list_application_windows" for item in results):
-        return "\n\n".join(deterministic_list_application_windows_reply(item) for item in results)
-
-    if len(results) == 1 and results[0].get("tool") == "close_application":
-        return deterministic_close_application_reply(results[0])
-
-    if len(results) == 1 and results[0].get("tool") == "list_application_windows":
-        return deterministic_list_application_windows_reply(results[0])
-
-    notepad_tools = {"notepad_open", "open_notepad_with_text", "notepad_type", "notepad_save", "notepad_save_as", "notepad_close"}
-    if all(item.get("tool") in notepad_tools for item in results):
-        return deterministic_notepad_reply(results)
-
-    if len(results) != 1:
-        return None
-    item = results[0]
-    tool = item.get("tool")
-
-    if tool == "notepad_open":
-        if not item.get("ok"):
-            return "I could not open the managed Notepad note."
-        result = item.get("result") or {}
-        path = result.get("path")
-        if path:
-            return f"I opened the managed Notepad note. File: {path}"
-        return "I opened the managed Notepad note."
-
-    if tool == "open_notepad_with_text":
-        if not item.get("ok"):
-            return "I could not open Notepad with the requested text."
-        result = item.get("result") or {}
-        path = result.get("path")
-        characters = result.get("characters")
-        if path and isinstance(characters, int):
-            return f"I opened Notepad with the requested text ({characters} characters). File: {path}"
-        return "I opened Notepad with the requested text."
-
-    if tool == "notepad_type":
-        if not item.get("ok"):
-            return "I could not add text to the managed Notepad note."
-        result = item.get("result") or {}
-        path = result.get("path")
-        characters = result.get("characters_added")
-        if path and isinstance(characters, int):
-            return f"I added the text to the managed Notepad note ({characters} characters). File: {path}"
-        return "I added the text to the managed Notepad note."
-
-    if tool == "notepad_save":
-        if not item.get("ok"):
-            return "I could not save the managed Notepad note."
-        result = item.get("result") or {}
-        path = result.get("path")
-        characters = result.get("characters")
-        if path and isinstance(characters, int):
-            return f"The managed Notepad note is saved ({characters} characters). File: {path}"
-        return "The managed Notepad note is saved."
-
-    if tool == "notepad_close":
-        if not item.get("ok"):
-            result = item.get("result") or {}
-            remaining = result.get("remaining")
-            if remaining:
-                return f"I asked the agent-launched Notepad windows to close, but some are still open: {remaining}."
-            return "I could not close the agent-launched Notepad windows."
-        result = item.get("result") or {}
-        closed = result.get("closed")
-        if isinstance(closed, int):
-            return f"I closed {closed} agent-launched Notepad window{'s' if closed != 1 else ''}."
-        return "I closed the agent-launched Notepad windows."
-
-    if tool == "clipboard_write":
-        if not item.get("ok"):
-            return "I could not update the clipboard."
-        result = item.get("result") or {}
-        characters = result.get("characters")
-        if isinstance(characters, int):
-            return f"I copied the text to the clipboard ({characters} characters)."
-        return "I copied the text to the clipboard."
-
-    if tool != "youtube_search_open":
-        return None
-
-    result = item.get("result") or {}
-    if not item.get("ok"):
-        return "I could not fetch a direct YouTube result, and the browser did not confirm opening fallback search results."
-
-    mode = result.get("mode")
-    title = result.get("title")
-    url = result.get("url")
-    query = result.get("query")
-    if mode in {"best_result", "known_result"} and url:
-        if title:
-            return f"I opened the best YouTube result I found: {title} ({url})."
-        return f"I opened the best YouTube result I found: {url}."
-    if mode == "search_results" and url:
-        return f"I opened YouTube search results for {query!r}: {url}. I could not confirm a single best result."
-    return None
+        return "No tool action was completed."
+    return " ".join(summarize_tool_result(item) for item in results)
 
 
-def format_application_name(application: str) -> str:
-    return {"notepad": "Notepad", "calculator": "Calculator", "calc": "Calculator", "chrome": "Chrome", "whatsapp": "WhatsApp"}.get(
-        application.lower(),
-        application,
-    )
-
-
-def deterministic_notepad_reply(results: list[dict[str, Any]]) -> str:
-    failed = [item for item in results if not item.get("ok")]
-    if failed:
-        tool = failed[0].get("tool")
-        if tool == "notepad_type":
-            return "I could not add text because the managed Notepad window did not close cleanly."
-        if tool == "notepad_close":
-            result = failed[0].get("result") or {}
-            remaining = result.get("remaining")
-            return f"I updated the note, but some Notepad windows are still open: {remaining}."
-        return "I could not complete the full Notepad request."
-
-    opened_item = next((item for item in results if item.get("tool") in {"notepad_open", "open_notepad_with_text"}), None)
-    typed = next((item for item in results if item.get("tool") == "notepad_type"), None)
-    saved = next((item for item in results if item.get("tool") in {"notepad_save", "notepad_save_as"}), None)
-    closed = next((item for item in results if item.get("tool") == "notepad_close"), None)
-
-    pieces: list[str] = []
-    if opened_item:
-        result = opened_item.get("result") or {}
-        characters = result.get("characters")
-        if isinstance(characters, int) and characters > 0:
-            pieces.append("opened Notepad with the requested text")
-        else:
-            pieces.append("opened Notepad")
-    if typed:
-        result = typed.get("result") or {}
-        characters = result.get("characters_added")
-        if isinstance(characters, int):
-            pieces.append(f"added {characters} characters")
-        else:
-            pieces.append("added the text")
-    if saved:
-        result = saved.get("result") or {}
-        path = result.get("path")
-        if path:
-            pieces.append(f"saved it as {path}")
-        else:
-            pieces.append("saved it")
-    if closed:
-        result = closed.get("result") or {}
-        count = result.get("closed")
-        targeted = result.get("targeted")
-        if isinstance(count, int):
-            if isinstance(targeted, int) and targeted == 0:
-                pieces.append("found no visible Notepad windows to close")
-            else:
-                pieces.append(f"closed {count} Notepad window{'s' if count != 1 else ''}")
-        else:
-            pieces.append("closed Notepad")
-
-    if pieces:
-        return "I " + ", ".join(pieces) + "."
-    return "I completed the Notepad request."
-
-
-def deterministic_close_application_reply(item: dict[str, Any]) -> str:
+def summarize_tool_result(item: dict[str, Any]) -> str:
+    tool_name = str(item.get("tool") or "tool")
+    result = item.get("result") if isinstance(item.get("result"), dict) else {}
     error = item.get("error")
-    if not item.get("ok") and error:
-        return f"I could not close the application: {error}"
+    if error:
+        return f"I could not run {tool_name}: {error}."
 
-    result = item.get("result") or {}
-    application = format_application_name(str(result.get("application") or "application"))
-    closed = result.get("closed")
-    targeted = result.get("targeted")
-    remaining = result.get("remaining")
+    if tool_name == "open_application":
+        app = display_application(str(result.get("application") or "application"))
+        return f"I opened {app}." if item.get("ok") else f"I could not open {app}."
 
-    if item.get("ok"):
-        if isinstance(closed, int):
-            if isinstance(targeted, int) and targeted == 0:
-                return f"No visible {application} windows were found."
-            return f"I closed {closed} visible {application} window{'s' if closed != 1 else ''}."
-        return f"I closed the visible {application} windows."
+    if tool_name in {"close_application", "notepad_close"}:
+        default_app = "notepad" if tool_name == "notepad_close" else "application"
+        app = display_application(str(result.get("application") or default_app))
+        closed = result.get("closed")
+        targeted = result.get("targeted")
+        if item.get("ok") and targeted == 0:
+            return f"No visible {app} windows were found."
+        if item.get("ok") and isinstance(closed, int):
+            return f"I closed {closed} visible {app} window{'s' if closed != 1 else ''}."
+        remaining = result.get("remaining")
+        return f"I could not close every {app} window; remaining: {remaining}."
 
-    if remaining:
-        return f"I tried to close {application}, but some windows are still open: {remaining}."
-    return f"I could not close {application}."
+    if tool_name == "list_application_windows":
+        app = display_application(str(result.get("application") or "application"))
+        windows = result.get("windows") or []
+        if not item.get("ok"):
+            return f"I could not inspect {app} windows."
+        if not windows:
+            return f"No visible {app} windows are open."
+        titles = [str(window.get("title") or "untitled") for window in windows[:5]]
+        return f"Visible {app} windows ({len(windows)}): {', '.join(titles)}."
+
+    if tool_name == "open_url":
+        url = str(result.get("url") or "the requested URL")
+        return f"I opened {url}." if item.get("ok") else f"The browser did not confirm opening {url}."
+
+    if tool_name == "youtube_search_open":
+        url = result.get("url")
+        title = result.get("title")
+        if not item.get("ok"):
+            return "I could not open a YouTube result."
+        if title and url:
+            return f"I opened the best YouTube result: {title} ({url})."
+        if url:
+            return f"I opened YouTube results at {url}."
+
+    if tool_name in {"notepad_open", "open_notepad_with_text", "notepad_type", "notepad_save", "notepad_save_as"}:
+        message = str(result.get("message") or "Notepad action completed.")
+        path = result.get("path")
+        if not item.get("ok"):
+            return f"Notepad action failed: {message}"
+        return f"{message} File: {path}." if path else message
+
+    if tool_name == "clipboard_write":
+        count = result.get("characters")
+        return f"I copied {count} characters to the clipboard." if isinstance(count, int) else "I updated the clipboard."
+
+    if tool_name == "clipboard_read":
+        text = str(result.get("text") or "")
+        return f"Clipboard text: {text}" if text else "The clipboard does not contain text."
+
+    if tool_name == "system_information":
+        return (
+            f"System: {result.get('windows')}; CPU: {result.get('cpu')} "
+            f"({result.get('cpu_physical_cores')} physical, {result.get('cpu_logical_cores')} logical cores); "
+            f"RAM: {result.get('ram_total_gb')} GB total, {result.get('ram_available_gb')} GB available."
+        )
+
+    if tool_name == "list_processes":
+        processes = result.get("processes") or []
+        names = [str(process.get("name")) for process in processes[:5]]
+        return f"Running processes: {result.get('count', len(processes))}; examples: {', '.join(names)}."
+
+    if tool_name == "active_window":
+        if not item.get("ok"):
+            return "I could not identify the active window."
+        return f"Active window: {result.get('title') or '(untitled)'} ({result.get('process') or 'unknown'})."
+
+    message = result.get("message")
+    if message:
+        return str(message).rstrip(".") + "."
+    return f"{tool_name.replace('_', ' ').capitalize()} {'completed' if item.get('ok') else 'failed'}."
 
 
-def deterministic_multi_close_application_reply(results: list[dict[str, Any]]) -> str:
-    parts: list[str] = []
-    for item in results:
-        sentence = deterministic_close_application_reply(item)
-        if sentence.endswith("."):
-            sentence = sentence[:-1]
-        parts.append(sentence)
-    return "; ".join(parts) + "."
+def display_application(application: str) -> str:
+    return {
+        "notepad": "Notepad",
+        "calculator": "Calculator",
+        "calc": "Calculator",
+        "chrome": "Chrome",
+        "whatsapp": "WhatsApp",
+    }.get(application.lower(), application)
 
 
-def deterministic_list_application_windows_reply(item: dict[str, Any]) -> str:
-    result = item.get("result") or {}
-    application = format_application_name(str(result.get("application") or "application"))
-    windows = result.get("windows") or []
-    if not item.get("ok"):
-        return f"I could not check visible {application} windows."
-    if not windows:
-        return f"No visible {application} windows are open."
+def message_text(message: Any) -> str:
+    content = getattr(message, "content", message)
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, dict) and isinstance(block.get("text"), str):
+                parts.append(block["text"])
+        return "".join(parts)
+    return "" if content is None else str(content)
 
-    lines = [f"Visible {application} windows ({len(windows)}):"]
-    for index, window in enumerate(windows[:12], start=1):
-        title = str(window.get("title") or "(untitled)")
-        pid = window.get("pid")
-        lines.append(f"{index}. {title} (pid {pid})")
-    if len(windows) > 12:
-        lines.append(f"...and {len(windows) - 12} more.")
+
+def render_history(messages: list[BaseMessage]) -> str:
+    lines: list[str] = []
+    for message in messages:
+        role = "User" if isinstance(message, HumanMessage) else "Assistant"
+        text = message_text(message).strip()
+        if text:
+            lines.append(f"{role}: {text}")
     return "\n".join(lines)
 
 
-def static_result(content: str) -> LLMResult:
+def measured_result(
+    content: str,
+    started_at: float,
+    first_token_at: float | None = None,
+) -> LLMResult:
+    total = max(0.0, time.perf_counter() - started_at)
+    ttft = total if first_token_at is None else max(0.0, first_token_at - started_at)
     return LLMResult(
         content=content,
         metrics=GenerationMetrics(
-            ttft_seconds=0.0,
-            total_seconds=0.0,
+            ttft_seconds=ttft,
+            total_seconds=total,
             output_characters=len(content),
-            approx_tokens=0,
+            approx_tokens=estimate_tokens(content),
         ),
     )
-
-
-def parse_clipboard_write(text: str) -> str | None:
-    lower = text.lower()
-    if "clipboard" not in lower or not any(word in lower for word in ("copy", "write", "put", "set")):
-        return None
-
-    quoted = re.search(r'"([^"]+)"', text)
-    if quoted:
-        return quoted.group(1)
-
-    match = re.search(r"(?:copy|write|put|set)\s+(.+?)\s+(?:to|on|into)\s+(?:the\s+)?clipboard", text, re.IGNORECASE)
-    if match:
-        return match.group(1).strip()
-    return None
-
-
-def parse_notepad_command(text: str) -> dict[str, Any] | None:
-    lower = text.lower()
-    if not re.search(r"\bnote\s*pad\b|\bnotepad\b", lower):
-        return None
-
-    actions: list[dict[str, Any]] = []
-    text_to_type = extract_text_to_write(text)
-    save_as_filename = extract_save_as_filename(text)
-    wants_open = any(word in lower for word in ("open", "launch", "start"))
-    wants_type = text_to_type is not None and any(word in lower for word in ("write", "type", "put", "add", "enter", "paste"))
-    wants_save = "save" in lower
-    wants_close = any(word in lower for word in ("close", "quit", "exit"))
-
-    if wants_open and wants_type:
-        actions.append({"tool": "notepad_open", "arguments": {"text": text_to_type}})
-    elif wants_open:
-        quoted = extract_quoted_text(text)
-        arguments = {"text": quoted} if quoted is not None else {}
-        actions.append({"tool": "notepad_open", "arguments": arguments})
-    elif wants_type:
-        actions.append({"tool": "notepad_type", "arguments": {"text": text_to_type}})
-
-    if save_as_filename is not None:
-        actions.append({"tool": "notepad_save_as", "arguments": {"filename": save_as_filename}})
-    elif wants_save:
-        actions.append({"tool": "notepad_save", "arguments": {}})
-
-    if wants_close:
-        actions.append({"tool": "notepad_close", "arguments": {}})
-
-    if actions:
-        return {"type": "tools", "actions": actions[:5]}
-
-    if any(word in lower for word in ("close", "quit", "exit")) and not any(
-        word in lower for word in ("write", "type", "put", "add", "enter", "paste")
-    ):
-        return {"type": "tools", "actions": [{"tool": "notepad_close", "arguments": {}}]}
-
-    if "save" in lower and not any(word in lower for word in ("write", "type", "put", "add", "enter", "paste")):
-        return {"type": "tools", "actions": [{"tool": "notepad_save", "arguments": {}}]}
-
-    if any(word in lower for word in ("type", "append", "add")):
-        text_to_type = extract_text_to_write(text)
-        if text_to_type is not None:
-            return {"type": "tools", "actions": [{"tool": "notepad_type", "arguments": {"text": text_to_type}}]}
-
-    if any(word in lower for word in ("open", "launch", "start")) and not any(
-        word in lower for word in ("write", "type", "put", "add", "enter", "paste")
-    ):
-        quoted = extract_quoted_text(text)
-        arguments = {"text": quoted} if quoted is not None else {}
-        return {"type": "tools", "actions": [{"tool": "notepad_open", "arguments": arguments}]}
-
-    return None
-
-
-def parse_notepad_write(text: str) -> str | None:
-    lower = text.lower()
-    if not re.search(r"\bnote\s*pad\b|\bnotepad\b", lower):
-        return None
-    if not any(word in lower for word in ("write", "type", "put", "add", "enter", "paste")):
-        return None
-
-    quoted = extract_quoted_text(text)
-    if quoted is not None:
-        return quoted
-
-    patterns = (
-        r"\b(?:write|type|put|add|enter|paste)\s+(?:in\s+it\s+|into\s+it\s+|to\s+it\s+)?(.+)$",
-        r"\b(?:write|type|put|add|enter|paste)\s+(?:this\s+)?(.+?)\s+(?:in|into|to)\s+(?:note\s*pad|notepad)\b",
-    )
-    for pattern in patterns:
-        match = re.search(pattern, text, re.IGNORECASE | re.DOTALL)
-        if not match:
-            continue
-        candidate = match.group(1)
-        candidate = re.sub(r"\s+(?:in|into|to)\s+(?:note\s*pad|notepad)\b.*$", "", candidate, flags=re.IGNORECASE | re.DOTALL)
-        candidate = candidate.strip(" \t\r\n\"'.")
-        if candidate:
-            return candidate
-    return None
-
-
-def parse_fuzzy_notepad_write_confirmation(text: str) -> dict[str, Any] | None:
-    lower = text.lower()
-    if not any(word in lower for word in ("write", "type", "put", "add", "enter", "paste")):
-        return None
-
-    requested_app = extract_open_target(text)
-    if requested_app is None:
-        return None
-
-    app, score = fuzzy_application_match(requested_app)
-    if app != "notepad" or score < 0.55:
-        return None
-
-    text_to_write = extract_text_to_write(text)
-    if text_to_write is None:
-        return None
-
-    return confirm_decision(
-        f'Did you mean: open Notepad and write "{text_to_write}"? Reply yes to run it, or no to cancel.',
-        [{"tool": "open_notepad_with_text", "arguments": {"text": text_to_write}}],
-    )
-
-
-def parse_fuzzy_open_application_confirmation(text: str) -> dict[str, Any] | None:
-    requested_app = extract_open_target(text)
-    if requested_app is None:
-        return None
-
-    app, score = fuzzy_application_match(requested_app)
-    if app is None or score < 0.55:
-        return None
-
-    actions = [{"tool": "open_application", "arguments": {"application": app}}]
-    url = parse_open_url(text)
-    if url is not None:
-        actions.append({"tool": "open_url", "arguments": {"url": url}})
-
-    label = {"notepad": "Notepad", "calculator": "Calculator", "chrome": "Chrome"}[app]
-    if url is not None:
-        content = f"Did you mean: open {label} and go to {url}? Reply yes to run it, or no to cancel."
-    else:
-        content = f"Did you mean: open {label}? Reply yes to run it, or no to cancel."
-    return confirm_decision(content, actions)
-
-
-def confirm_decision(content: str, actions: list[dict[str, Any]]) -> dict[str, Any]:
-    return {"type": "confirm", "content": content, "decision": {"type": "tools", "actions": actions[:3]}}
-
-
-def extract_text_to_write(text: str) -> str | None:
-    quoted = extract_quoted_text(text)
-    if quoted is not None:
-        return quoted
-
-    match = re.search(r"\b(?:write|type|put|add|enter|paste)\s+(?:in\s+it\s+|into\s+it\s+|to\s+it\s+)?(.+)$", text, re.IGNORECASE | re.DOTALL)
-    if not match:
-        return None
-    candidate = match.group(1)
-    candidate = re.sub(r"\s+(?:in|into|to)\s+\S+.*$", "", candidate, flags=re.IGNORECASE | re.DOTALL)
-    candidate = candidate.strip(" \t\r\n\"'.")
-    return candidate or None
-
-
-def extract_save_as_filename(text: str) -> str | None:
-    patterns = (
-        r"\bsave\s+(?:the\s+)?(?:file\s+)?as\s+\"([^\"]+)\"",
-        r"\bsave\s+(?:the\s+)?(?:file\s+)?as\s+'([^']+)'",
-        r"\bsave\s+(?:the\s+)?(?:file\s+)?as\s+([A-Za-z0-9 _.-]+)",
-    )
-    for pattern in patterns:
-        match = re.search(pattern, text, re.IGNORECASE)
-        if not match:
-            continue
-        filename = match.group(1).strip(" \t\r\n\"'.")
-        filename = re.split(r"\s+\b(?:and|then)\b", filename, maxsplit=1, flags=re.IGNORECASE)[0].strip(" \t\r\n\"'.")
-        if filename:
-            return filename
-    return None
-
-
-def extract_quoted_text(text: str) -> str | None:
-    quoted = re.search(r'"([^"]*)"', text, re.DOTALL)
-    if quoted:
-        return quoted.group(1)
-
-    single_quoted = re.search(r"'([^']*)'", text, re.DOTALL)
-    if single_quoted:
-        return single_quoted.group(1)
-    return None
-
-
-def extract_open_target(text: str) -> str | None:
-    match = re.search(r"\b(?:open|launch|start)\s+(.+)$", text, re.IGNORECASE | re.DOTALL)
-    if not match:
-        return None
-    requested = match.group(1)
-    requested = re.split(r"\s+\b(?:and|then|with|to|on|please)\b", requested, maxsplit=1, flags=re.IGNORECASE)[0]
-    requested = requested.strip(" \t\r\n\"'.,")
-    return requested or None
-
-
-def fuzzy_application_match(value: str) -> tuple[str | None, float]:
-    normalized = normalize_match_text(value)
-    if not normalized:
-        return None, 0.0
-
-    best_app: str | None = None
-    best_score = 0.0
-    for app, aliases in OPEN_APPLICATION_ALIASES.items():
-        for alias in aliases:
-            score = difflib.SequenceMatcher(None, normalized, normalize_match_text(alias)).ratio()
-            if score > best_score:
-                best_app = app
-                best_score = score
-    return best_app, best_score
-
-
-def normalize_match_text(value: str) -> str:
-    return re.sub(r"[^a-z0-9]+", " ", value.lower()).strip()
-
-
-def asks_capabilities(lower: str) -> bool:
-    phrases = (
-        "what can you do",
-        "what are your capabilities",
-        "what tools do you have",
-        "what can i ask",
-        "help me use this",
-    )
-    return any(phrase in lower for phrase in phrases)
-
-
-def parse_youtube_query(text: str, last_youtube_query: str | None) -> str | None:
-    lower = text.lower()
-    if "youtube" not in lower and "yt" not in lower:
-        return None
-    if re.search(r"\b(?:search\s+for|open|go to|visit)\s+(?:https?://)?(?:www\.)?youtube\.com\b", lower):
-        return None
-    if any(word in lower for word in ("again", "same", "it")) and last_youtube_query:
-        return last_youtube_query
-    if not any(word in lower for word in ("open", "search", "find", "play", "playlist", "video", "series")):
-        return None
-
-    channel_query = parse_youtube_channel_query(text)
-    if channel_query is not None:
-        return f"{channel_query} channel"
-
-    query = re.sub(r"https?://\S+", " ", text, flags=re.IGNORECASE)
-    replacements = (
-        r"\bon youtube\b",
-        r"\byoutube\b",
-        r"\byt\b",
-        r"\bplease\b",
-        r"\bnow\b",
-        r"\bok\b",
-        r"\bopen\b",
-        r"\bsearch\s+for\b",
-        r"\bsearch\b",
-        r"\bfind\b",
-        r"\bplay\b",
-        r"\bthe\b",
-    )
-    for pattern in replacements:
-        query = re.sub(pattern, " ", query, flags=re.IGNORECASE)
-    query = " ".join(query.strip(" .,!?:;\"'").split())
-    if query.lower() in {"com", ".com", "youtube.com", "www.youtube.com"}:
-        return None
-    if not query and last_youtube_query:
-        return last_youtube_query
-    return query or None
-
-
-def parse_youtube_channel_query(text: str) -> str | None:
-    lower = text.lower()
-    if "channel" not in lower:
-        return None
-    patterns = (
-        r"(?:youtube\s+)?channel\s+(?:of|for|called|named)?\s+(.+)$",
-        r"(.+?)\s+(?:youtube\s+)?channel\b",
-    )
-    for pattern in patterns:
-        match = re.search(pattern, text, re.IGNORECASE)
-        if not match:
-            continue
-        candidate = match.group(1)
-        candidate = re.sub(r"^.*?\b(?:open|find|search for|show me|want you to open)\b", " ", candidate, flags=re.IGNORECASE)
-        candidate = re.sub(r"\b(?:the|youtube|channel|of|for|called|named|please|again|video|opened|you|i|want|to|open)\b", " ", candidate, flags=re.IGNORECASE)
-        candidate = " ".join(candidate.strip(" .,!?:;\"'").split())
-        if candidate:
-            return candidate
-    return None
-
-
-def get_youtube_query_from_decision(decision: dict[str, Any]) -> str | None:
-    actions = decision.get("actions")
-    if not isinstance(actions, list):
-        return None
-    for action in actions:
-        if not isinstance(action, dict):
-            continue
-        if action.get("tool") == "youtube_search_open":
-            arguments = action.get("arguments") or {}
-            query = arguments.get("query")
-            if isinstance(query, str) and query.strip():
-                return query.strip()
-    return None
-
-
-def parse_open_application(lower: str) -> str | None:
-    if "open" not in lower and "launch" not in lower and "start" not in lower:
-        return None
-    if re.search(r"\bnote\s+pad\b|\bnotepad\b", lower):
-        return "notepad"
-    if re.search(r"\bwhats\s*app\b|\bwhatsapp\b", lower):
-        return "whatsapp"
-    for name in ("notepad", "calculator", "calc", "chrome", "whatsapp"):
-        if re.search(rf"\b{name}\b", lower):
-            return name
-    return None
-
-
-def parse_list_application_windows(lower: str) -> list[str]:
-    if not any(word in lower for word in ("list", "show", "check", "inspect", "see")):
-        return []
-    if not any(word in lower for word in ("window", "windows", "open")):
-        return []
-    return parse_application_names_from_text(lower)
-
-
-def parse_close_application(lower: str) -> list[str]:
-    if not any(word in lower for word in ("close", "quit", "exit")):
-        return []
-    return parse_application_names_from_text(lower)
-
-
-def parse_application_name_from_text(lower: str) -> str | None:
-    names = parse_application_names_from_text(lower)
-    return names[0] if names else None
-
-
-def parse_application_names_from_text(lower: str) -> list[str]:
-    matches: list[tuple[int, str]] = []
-    if re.search(r"\bnote\s+pad\b|\bnotepad\b", lower):
-        match = re.search(r"\bnote\s+pad\b|\bnotepad\b", lower)
-        if match:
-            matches.append((match.start(), "notepad"))
-    whatsapp_match = re.search(r"\bwhats\s*app\b|\bwhatsapp\b", lower)
-    if whatsapp_match:
-        matches.append((whatsapp_match.start(), "whatsapp"))
-    for name, app in (("calculator", "calculator"), ("calc", "calc"), ("chrome", "chrome")):
-        match = re.search(rf"\b{name}\b", lower)
-        if match:
-            matches.append((match.start(), app))
-
-    ordered: list[str] = []
-    for _, app in sorted(matches, key=lambda item: item[0]):
-        if app not in ordered:
-            ordered.append(app)
-    return ordered
-
-
-def looks_like_unsupported_open_request(text: str) -> bool:
-    lower = text.lower().strip()
-    if re.search(r"https?://", text, re.IGNORECASE):
-        return False
-    if "google" in lower:
-        return False
-    match = re.match(r"^(open|launch|start)\s+(.+)$", lower)
-    if not match:
-        return False
-    requested = match.group(2).strip()
-    if not requested:
-        return False
-    if any(word in requested for word in ("process", "system", "clipboard", "window")):
-        return False
-    return True
-
-
-def parse_open_url(text: str) -> str | None:
-    match = re.search(r"https?://[^\s]+", text, re.IGNORECASE)
-    if match:
-        return match.group(0).rstrip(".,)")
-
-    domain = find_bare_domain(text)
-    if domain is not None:
-        return "https://" + domain.removeprefix("www.")
-
-    lower = text.lower()
-    if "google" in lower and any(phrase in lower for phrase in ("go to", "open", "browse", "visit")):
-        return "https://www.google.com"
-
-    target = parse_navigation_target(text)
-    if target:
-        if looks_like_domain(target):
-            return "https://" + target.removeprefix("www.")
-        if "search" in lower:
-            return "https://www.google.com/search?q=" + quote_plus(target)
-    return None
-
-
-def find_bare_domain(text: str) -> str | None:
-    match = re.search(r"\b(?:www\.)?[A-Za-z0-9-]+\.(?:com|org|net|in|io|dev|ai|co|edu|gov)\b/?", text, re.IGNORECASE)
-    if not match:
-        return None
-    return match.group(0).strip().rstrip(".,)")
-
-
-def parse_navigation_target(text: str) -> str | None:
-    patterns = (
-        r"\b(?:go to|visit|open)\s+([A-Za-z0-9][^\s,]*)",
-        r"\bsearch\s+(?:for\s+)?(.+)$",
-    )
-    for pattern in patterns:
-        match = re.search(pattern, text, re.IGNORECASE)
-        if match:
-            target = match.group(1).strip().strip("\"'.,)")
-            if target.lower() in {"chrome", "notepad", "calculator", "calc"}:
-                continue
-            return target
-    return None
-
-
-def looks_like_domain(value: str) -> bool:
-    return bool(re.fullmatch(r"(?:www\.)?[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+/?", value.strip()))

@@ -4,16 +4,15 @@ mcp==2.3.0
 # Lightweight HTTP client for talking to the llamafile OpenAI-compatible API.
 httpx==0.28.1
 
+# LangChain agent, OpenAI-compatible local model adapter, and graph runtime.
+langchain>=1.0,<2.0
+langchain-openai>=1.0,<2.0
+langgraph>=1.0,<2.0
+
 # Process listing, RAM/CPU information, and other basic system stats.
 psutil==7.2.2
 
 # Windows API access for active-window detection and clipboard support.
 pywin32==312
 
-# Optional offline voice input:
-# SpeechRecognition handles microphone capture; pocketsphinx provides offline STT;
-# PyAudio provides Windows microphone access for SpeechRecognition.
-SpeechRecognition==3.14.3
-pocketsphinx==5.0.4
-PyAudio==0.2.14
-vosk==0.3.45
+# Voice input is disabled. Its optional packages are kept in requirements-voice.txt.

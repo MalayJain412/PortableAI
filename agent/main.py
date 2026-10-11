@@ -86,7 +86,16 @@ def print_banner() -> None:
 ║                                                                  ║
 ╚══════════════════════════════════════════════════════════════════╝
 """
-    print(banner)
+    try:
+        print(banner)
+    except UnicodeEncodeError:
+        print("=" * 68)
+        print(" SENTRY - LOCAL INTELLIGENCE SYSTEM")
+        print(" Local Qwen3.5 0.8B | Windows Agent | Portable | Private")
+        print(" Developed by Malay Jain")
+        print("=" * 68)
+
+
 def print_metrics(metrics: GenerationMetrics) -> None:
     ttft = "n/a" if metrics.ttft_seconds is None else f"{metrics.ttft_seconds:.2f}s"
     print(
@@ -109,6 +118,7 @@ async def run_chat() -> int:
     print(HELP_TEXT)
 
     agent = PortableAgent(llm)
+    await agent.initialize()
     input_mode = "text"
     voice_engine = "auto"
     voice_confirm = True
@@ -221,8 +231,7 @@ async def run_chat() -> int:
             print(f"Detected Vosk model: {selected_model if selected_model else 'none'}")
             continue
         if command == "/clear":
-            agent.history.clear()
-            agent.pending_confirmation = None
+            agent.clear_history()
             print("Chat memory cleared.")
             continue
 

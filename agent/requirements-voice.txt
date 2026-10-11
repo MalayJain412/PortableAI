@@ -1,0 +1,6 @@
+# Optional offline voice input. Install separately only when voice mode is re-enabled.
+# PyAudio may require a compatible prebuilt wheel or Microsoft C++ Build Tools.
+SpeechRecognition==3.14.3
+pocketsphinx==5.0.4
+PyAudio==0.2.14
+vosk==0.3.45
