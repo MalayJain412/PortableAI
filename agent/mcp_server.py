@@ -30,6 +30,10 @@ def create_server() -> MCPServer:
     server.add_tool(windows_tools.active_window)
     server.add_tool(windows_tools.clipboard_read)
     server.add_tool(windows_tools.clipboard_write)
+    server.add_tool(windows_tools.create_directory)
+    server.add_tool(windows_tools.list_directory)
+    server.add_tool(windows_tools.summarize_directory)
+    # Raw MCP clients have no trusted confirmation handshake, so deletion remains chat-agent only.
 
     return server
 

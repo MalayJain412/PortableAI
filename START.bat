@@ -5,6 +5,7 @@ set "ROOT=%~dp0"
 if "%ROOT:~-1%"=="\" set "ROOT=%ROOT:~0,-1%"
 
 set "PYTHON=%ROOT%\runtime\venv\Scripts\python.exe"
+set "UV=%ROOT%\tools\uv.exe"
 set "MODEL=%ROOT%\models\Qwen3.5-0.8B-Q8_0.exe"
 set "LOGDIR=%ROOT%\logs"
 set "MODEL_LOG=%LOGDIR%\llamafile.log"
@@ -25,6 +26,15 @@ if not exist "%PYTHON%" (
 if not exist "%MODEL%" (
   echo Model executable not found:
   echo %MODEL%
+  pause
+  exit /b 1
+)
+
+"%PYTHON%" -c "import langchain, langchain_openai, langgraph" >nul 2>&1
+if errorlevel 1 (
+  echo Required Python packages are missing from the portable runtime.
+  echo Install them with:
+  echo "%UV%" pip install -r "%ROOT%\agent\requirements.txt" --python "%PYTHON%" --link-mode=copy
   pause
   exit /b 1
 )

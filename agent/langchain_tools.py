@@ -7,10 +7,30 @@ from langchain_core.tools import BaseTool
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 import windows_tools
-from security import validate_clipboard_text, validate_notepad_filename, validate_notepad_text, validate_url
+from security import (
+    resolve_managed_directory,
+    resolve_inspection_directory,
+    validate_clipboard_text,
+    validate_directory_path,
+    validate_notepad_filename,
+    validate_notepad_text,
+    validate_url,
+)
 
 
-ApplicationName = Literal["notepad", "calculator", "calc", "chrome", "whatsapp"]
+ApplicationName = Literal[
+    "notepad",
+    "calculator",
+    "calc",
+    "chrome",
+    "whatsapp",
+    "notion",
+    "vscode",
+    "github_desktop",
+    "outlook",
+    "mongodb_compass",
+    "termius",
+]
 
 
 class ToolInput(BaseModel):
@@ -23,7 +43,10 @@ class EmptyInput(ToolInput):
 
 class ApplicationInput(ToolInput):
     application: ApplicationName = Field(
-        description="Canonical allowlisted application name. Use notepad for 'note pad'."
+        description=(
+            "Canonical allowlisted desktop application: notepad, calculator, calc, chrome, whatsapp, notion, "
+            "vscode, github_desktop, outlook, mongodb_compass, or termius."
+        )
     )
 
 
@@ -77,6 +100,75 @@ class ClipboardTextInput(ToolInput):
     @classmethod
     def validate_text(cls, value: str) -> str:
         return _as_value_error(validate_clipboard_text, value)
+
+
+class DirectoryPathInput(ToolInput):
+    path: str = Field(
+        description=(
+            "Exact directory path named by the user, inside the managed PortableAI workspace. Preserve multi-word "
+            "names and nested separators. If the user names projects, send projects, never .; use . only when the "
+            "user explicitly requests the workspace root."
+        )
+    )
+
+    @field_validator("path")
+    @classmethod
+    def validate_path(cls, value: str) -> str:
+        cleaned = _as_value_error(validate_directory_path, value)
+        _as_value_error(lambda path: str(resolve_managed_directory(path)), cleaned)
+        return cleaned
+
+
+class DeleteDirectoryInput(DirectoryPathInput):
+    @field_validator("path")
+    @classmethod
+    def reject_workspace_root(cls, value: str) -> str:
+        _as_value_error(
+            lambda path: str(resolve_managed_directory(path, allow_root=False)),
+            value,
+        )
+        return value
+
+
+class InspectionDirectoryPathInput(ToolInput):
+    path: str = Field(
+        description=(
+            "Exact existing local directory to inspect. Use an absolute drive path such as E:\\ or E:\\Projects; "
+            "relative paths are based in the PortableAI workspace. Convert phrases like E drive to E:\\."
+        )
+    )
+
+    @field_validator("path")
+    @classmethod
+    def validate_path(cls, value: str) -> str:
+        cleaned = _as_value_error(validate_directory_path, value)
+        _as_value_error(lambda path: str(resolve_inspection_directory(path)), cleaned)
+        return cleaned
+
+
+class ListDirectoryInput(InspectionDirectoryPathInput):
+    recursive: bool = Field(
+        default=False,
+        description=(
+            "Set true only for explicit recursive, nested, entire-tree, or all-levels requests. Asking for all "
+            "items in one directory is not recursive."
+        ),
+    )
+    include: Literal["all", "directories", "files"] = Field(
+        default="all",
+        description=(
+            "Use directories when the user asks for folders, files when the user asks only for files, and all "
+            "when both are requested."
+        ),
+    )
+    output_format: Literal["compact", "tree"] = Field(
+        default="compact",
+        description="Use tree only when the user explicitly requests tree format; otherwise use compact.",
+    )
+
+
+class SummarizeDirectoryInput(InspectionDirectoryPathInput):
+    pass
 
 
 def _as_value_error(validator: Any, value: str) -> str:
@@ -142,7 +234,7 @@ def notepad_close() -> dict[str, Any]:
 
 @tool(args_schema=UrlInput)
 def open_url(url: str) -> dict[str, Any]:
-    """Open one complete HTTP or HTTPS URL. Use this for website navigation, including YouTube home."""
+    """Open an explicitly requested HTTP or HTTPS destination; never use as an app-opening fallback."""
     return windows_tools.open_url(url)
 
 
@@ -182,6 +274,35 @@ def clipboard_write(text: str) -> dict[str, Any]:
     return windows_tools.clipboard_write(text)
 
 
+@tool(args_schema=DirectoryPathInput)
+def create_directory(path: str) -> dict[str, Any]:
+    """Create one directory, including missing parents, inside the managed PortableAI workspace."""
+    return windows_tools.create_directory(path)
+
+
+@tool(args_schema=DeleteDirectoryInput)
+def delete_directory(path: str) -> dict[str, Any]:
+    """Permanently delete one directory and all its contents. The host must obtain user confirmation first."""
+    return windows_tools.delete_directory(path)
+
+
+@tool(args_schema=ListDirectoryInput)
+def list_directory(
+    path: str = ".",
+    recursive: bool = False,
+    include: Literal["all", "directories", "files"] = "all",
+    output_format: Literal["compact", "tree"] = "compact",
+) -> dict[str, Any]:
+    """List one directory's direct children, or its tree when recursion is explicitly requested; never reads contents."""
+    return windows_tools.list_directory(path, recursive, include, output_format)
+
+
+@tool(args_schema=SummarizeDirectoryInput)
+def summarize_directory(path: str = ".") -> dict[str, Any]:
+    """Summarize folder counts, file counts, sizes, and types without reading file contents."""
+    return windows_tools.summarize_directory(path)
+
+
 LANGCHAIN_TOOLS: list[BaseTool] = [
     open_application,
     close_application,
@@ -199,6 +320,10 @@ LANGCHAIN_TOOLS: list[BaseTool] = [
     active_window,
     clipboard_read,
     clipboard_write,
+    create_directory,
+    delete_directory,
+    list_directory,
+    summarize_directory,
 ]
 
 TOOL_REGISTRY: dict[str, BaseTool] = {item.name: item for item in LANGCHAIN_TOOLS}

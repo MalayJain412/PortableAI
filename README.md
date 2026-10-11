@@ -92,6 +92,18 @@ Close Chrome and WhatsApp
 ```
 
 ```text
+Open Notion
+```
+
+```text
+Open VS Code and GitHub Desktop
+```
+
+```text
+Open Outlook, MongoDB Compass, and Termius
+```
+
+```text
 Open Chrome and go to Google
 ```
 
@@ -109,6 +121,40 @@ Copy "Hello from my portable AI" to the clipboard
 
 ```text
 What are my basic system specs?
+```
+
+### Managed Directories
+
+Directory creation and deletion are confined to:
+
+```text
+F:\PortableAI\workspace
+```
+
+Relative paths are resolved from that folder. Listing and summarization can inspect any existing local drive directory, such as `E:\`, but cannot inspect network paths. They use names, sizes, and file metadata only and do not read file contents. Deleting a directory is recursive and always requires confirmation in chat.
+
+```text
+Create a directory named projects\demo
+```
+
+```text
+List the projects directory
+```
+
+```text
+What are the folders in E drive?
+```
+
+```text
+Recursively list projects\demo
+```
+
+```text
+Summarize the projects directory
+```
+
+```text
+Delete the projects\demo directory
 ```
 
 ## Safety

@@ -8,6 +8,7 @@ PROJECT_ROOT = AGENT_DIR.parent
 LOGS_DIR = PROJECT_ROOT / "logs"
 CACHE_DIR = PROJECT_ROOT / "cache"
 MODELS_DIR = PROJECT_ROOT / "models"
+WORKSPACE_DIR = PROJECT_ROOT / "workspace"
 MODEL_EXE = MODELS_DIR / "Qwen3.5-0.8B-Q8_0.exe"
 
 LLAMAFILE_HOST = "127.0.0.1"
@@ -18,6 +19,8 @@ MODEL_ID = "/zip/Qwen3.5-0.8B-Q8_0.gguf"
 CLIPBOARD_READ_LIMIT = 4096
 NOTEPAD_TEXT_LIMIT = 32768
 MAX_PROCESS_COUNT = 80
+DIRECTORY_LIST_LIMIT = 200
+DIRECTORY_SCAN_LIMIT = 5000
 
 ALLOWED_APPLICATIONS: dict[str, tuple[str, ...]] = {
     "notepad": ("notepad.exe",),
@@ -25,4 +28,11 @@ ALLOWED_APPLICATIONS: dict[str, tuple[str, ...]] = {
     "calc": ("calc.exe",),
     "chrome": ("chrome.exe",),
     "whatsapp": ("whatsapp.exe",),
+    "notion": ("notion.exe",),
+    "vscode": ("Code.exe",),
+    "github_desktop": ("GitHubDesktop.exe",),
+    "outlook": ("OUTLOOK.EXE",),
+    "mongodb_compass": ("MongoDBCompass.exe",),
+    "mongodb": ("MongoDBCompass.exe",),
+    "termius": ("Termius.exe",),
 }

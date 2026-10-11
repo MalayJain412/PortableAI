@@ -10,6 +10,7 @@ import subprocess
 import time
 import webbrowser
 import winreg
+from collections import Counter, deque
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -21,13 +22,31 @@ import win32clipboard
 import win32con
 import win32gui
 import win32process
+from mcp.server.mcpserver.exceptions import ToolError
 
-from config import CACHE_DIR, CLIPBOARD_READ_LIMIT, MAX_PROCESS_COUNT
-from security import validate_allowed_application, validate_clipboard_text, validate_notepad_filename, validate_notepad_text, validate_url
+from config import CACHE_DIR, CLIPBOARD_READ_LIMIT, DIRECTORY_LIST_LIMIT, DIRECTORY_SCAN_LIMIT, MAX_PROCESS_COUNT
+from security import (
+    managed_workspace_root,
+    resolve_inspection_directory,
+    resolve_managed_directory,
+    validate_allowed_application,
+    validate_clipboard_text,
+    validate_notepad_filename,
+    validate_notepad_text,
+    validate_url,
+)
 
 
 _NOTEPAD_PIDS: set[int] = set()
 _CURRENT_NOTEPAD_FILE = CACHE_DIR / "notepad" / "portable_ai_current_note.txt"
+_APPLICATION_SHELL_IDS: dict[str, str] = {
+    "notion.exe": "com.electron.notion",
+    "code.exe": "Microsoft.VisualStudioCode",
+    "githubdesktop.exe": "com.squirrel.GitHubDesktop.GitHubDesktop",
+    "outlook.exe": "Microsoft.Office.OUTLOOK.EXE.15",
+    "mongodbcompass.exe": "com.squirrel.MongoDBCompass.MongoDBCompass",
+    "termius.exe": "com.termius.mac",
+}
 
 
 def open_application(application: str) -> dict[str, Any]:
@@ -54,6 +73,12 @@ def close_application(application: str) -> dict[str, Any]:
     executable_names = allowed_process_names(allowed.command)
     title_keywords = allowed_title_keywords(allowed.name)
     windows = visible_windows_for_process_names(executable_names, title_keywords)
+
+    appearance_deadline = time.monotonic() + 0.8
+    while not windows and time.monotonic() < appearance_deadline:
+        time.sleep(0.08)
+        windows = visible_windows_for_process_names(executable_names, title_keywords)
+
     if not windows:
         return {
             "ok": True,
@@ -64,22 +89,35 @@ def close_application(application: str) -> dict[str, Any]:
             "message": f"No visible {allowed.name} windows were found.",
         }
 
-    for window in windows:
-        win32gui.PostMessage(window["hwnd"], win32con.WM_CLOSE, 0, 0)
-
-    deadline = time.monotonic() + 2.5
+    targeted: dict[int, dict[str, Any]] = {}
+    last_signal: dict[int, float] = {}
+    quiet_since: float | None = None
+    deadline = time.monotonic() + 4.0
     while time.monotonic() < deadline:
-        remaining = visible_windows_for_process_names(executable_names, title_keywords)
-        if not remaining:
+        now = time.monotonic()
+        current = visible_windows_for_process_names(executable_names, title_keywords)
+        if current:
+            quiet_since = None
+            for window in current:
+                hwnd = int(window["hwnd"])
+                targeted[hwnd] = window
+                if hwnd not in last_signal or now - last_signal[hwnd] >= 0.4:
+                    win32gui.PostMessage(hwnd, win32con.WM_CLOSE, 0, 0)
+                    last_signal[hwnd] = now
+        elif quiet_since is None:
+            quiet_since = now
+        elif now - quiet_since >= 0.6:
             break
-        time.sleep(0.05)
+        time.sleep(0.08)
 
     remaining = visible_windows_for_process_names(executable_names, title_keywords)
+    remaining_handles = {int(item["hwnd"]) for item in remaining}
+    closed = len(set(targeted) - remaining_handles)
     return {
         "ok": not remaining,
         "application": allowed.name,
-        "closed": len(windows) - len(remaining),
-        "targeted": len(windows),
+        "closed": closed,
+        "targeted": len(targeted),
         "remaining": [{"pid": item["pid"], "title": item["title"]} for item in remaining],
         "message": f"{allowed.name} windows closed." if not remaining else f"Some {allowed.name} windows are still open.",
     }
@@ -197,6 +235,196 @@ def notepad_close() -> dict[str, Any]:
     return close_application("notepad")
 
 
+def create_directory(path: str) -> dict[str, Any]:
+    """Create a directory and any missing parents inside the managed workspace."""
+    target = resolve_managed_directory(path)
+    existed = target.exists()
+    target.mkdir(parents=True, exist_ok=True)
+    return {
+        "ok": True,
+        "path": str(target),
+        "relative_path": workspace_relative_path(target),
+        "created": not existed,
+        "message": "Directory created." if not existed else "Directory already exists.",
+    }
+
+
+def delete_directory(path: str) -> dict[str, Any]:
+    """Permanently delete a directory tree inside the managed workspace."""
+    target = resolve_managed_directory(path, must_exist=True, allow_root=False)
+    summary = directory_summary_data(target)
+    shutil.rmtree(target)
+    return {
+        "ok": True,
+        "path": str(target),
+        "relative_path": workspace_relative_path(target),
+        "deleted_directories": summary["directories"] + 1,
+        "deleted_files": summary["files"],
+        "deleted_bytes": summary["total_bytes"],
+        "scan_truncated": summary["truncated"],
+        "message": "Directory and its contents were permanently deleted.",
+    }
+
+
+def list_directory(
+    path: str = ".",
+    recursive: bool = False,
+    include: str = "all",
+    output_format: str = "compact",
+) -> dict[str, Any]:
+    """List bounded directory metadata without reading file contents."""
+    if include not in {"all", "directories", "files"}:
+        raise ToolError("Directory listing include must be all, directories, or files.")
+    if output_format not in {"compact", "tree"}:
+        raise ToolError("Directory listing output format must be compact or tree.")
+    target = resolve_inspection_directory(path)
+    entries, truncated, inaccessible = scan_directory_entries(
+        target,
+        recursive=recursive,
+        limit=DIRECTORY_LIST_LIMIT,
+        include=include,
+    )
+    return {
+        "ok": True,
+        "path": str(target),
+        "relative_path": directory_display_path(target),
+        "recursive": recursive,
+        "include": include,
+        "output_format": output_format,
+        "count": len(entries),
+        "truncated": truncated,
+        "inaccessible": inaccessible,
+        "entries": entries,
+        "message": "Directory contents listed.",
+    }
+
+
+def summarize_directory(path: str = ".") -> dict[str, Any]:
+    """Summarize a directory tree from names and metadata without reading file contents."""
+    target = resolve_inspection_directory(path)
+    summary = directory_summary_data(target)
+    return {
+        "ok": True,
+        "path": str(target),
+        "relative_path": directory_display_path(target),
+        **summary,
+        "message": "Directory summary generated from file metadata.",
+    }
+
+
+def directory_summary_data(path: Path) -> dict[str, Any]:
+    entries, truncated, inaccessible = scan_directory_entries(
+        path,
+        recursive=True,
+        limit=DIRECTORY_SCAN_LIMIT,
+    )
+    files = [entry for entry in entries if entry["type"] == "file"]
+    directories = [entry for entry in entries if entry["type"] == "directory"]
+    links = [entry for entry in entries if entry["type"] == "link"]
+    extensions = Counter(
+        Path(str(entry["name"])).suffix.lower() or "[no extension]"
+        for entry in files
+    )
+    largest_files = sorted(
+        files,
+        key=lambda item: int(item.get("size_bytes", 0)),
+        reverse=True,
+    )[:5]
+    return {
+        "directories": len(directories),
+        "files": len(files),
+        "links": len(links),
+        "total_bytes": sum(int(entry.get("size_bytes", 0)) for entry in files),
+        "extensions": dict(extensions.most_common(10)),
+        "largest_files": [
+            {"path": entry["path"], "size_bytes": entry.get("size_bytes", 0)}
+            for entry in largest_files
+        ],
+        "scanned_entries": len(entries),
+        "truncated": truncated,
+        "inaccessible": inaccessible,
+    }
+
+
+def scan_directory_entries(
+    path: Path,
+    *,
+    recursive: bool,
+    limit: int,
+    include: str = "all",
+) -> tuple[list[dict[str, Any]], bool, int]:
+    entries: list[dict[str, Any]] = []
+    directories: deque[Path] = deque([path])
+    inaccessible = 0
+    scanned = 0
+    while directories:
+        current = directories.popleft()
+        try:
+            children = sorted(os.scandir(current), key=lambda entry: entry.name.lower())
+        except OSError:
+            inaccessible += 1
+            continue
+
+        for child in children:
+            scanned += 1
+            if scanned > DIRECTORY_SCAN_LIMIT:
+                return entries, True, inaccessible
+            child_path = Path(child.path)
+            is_junction = getattr(child_path, "is_junction", lambda: False)
+            try:
+                if child.is_symlink() or is_junction():
+                    entry_type = "link"
+                elif child.is_dir(follow_symlinks=False):
+                    entry_type = "directory"
+                elif child.is_file(follow_symlinks=False):
+                    entry_type = "file"
+                else:
+                    entry_type = "other"
+                size = child.stat(follow_symlinks=False).st_size if entry_type == "file" else 0
+            except OSError:
+                inaccessible += 1
+                continue
+
+            relative = child_path.relative_to(path)
+            should_include = (
+                include == "all"
+                or (include == "directories" and entry_type == "directory")
+                or (include == "files" and entry_type == "file")
+            )
+            if should_include:
+                if len(entries) >= limit:
+                    return entries, True, inaccessible
+                entries.append(
+                    {
+                        "name": child.name,
+                        "path": str(relative),
+                        "type": entry_type,
+                        "size_bytes": size,
+                    }
+                )
+            if recursive and entry_type == "directory":
+                directories.append(child_path)
+    return entries, False, inaccessible
+
+
+def workspace_relative_path(path: Path) -> str:
+    root = managed_workspace_root()
+    try:
+        relative = path.relative_to(root)
+    except ValueError as exc:
+        raise ToolError("Resolved path escaped the managed workspace.") from exc
+    return str(relative) if relative.parts else "."
+
+
+def directory_display_path(path: Path) -> str:
+    root = managed_workspace_root()
+    try:
+        relative = path.relative_to(root)
+    except ValueError:
+        return str(path)
+    return str(relative) if relative.parts else "."
+
+
 def close_active_notepad_sessions() -> dict[str, Any]:
     pids = active_notepad_pids()
     if not pids:
@@ -280,6 +508,8 @@ def allowed_process_names(command: tuple[str, ...]) -> set[str]:
         names.add("calculatorapp.exe")
     if executable == "whatsapp.exe":
         names.update({"whatsapp.exe", "whatsappbeta.exe"})
+    if executable == "outlook.exe":
+        names.add("olk.exe")
     return names
 
 
@@ -318,6 +548,9 @@ def resolve_allowed_command(command: tuple[str, ...]) -> list[str]:
     resolved = resolve_executable(executable)
     if executable.lower() == "whatsapp.exe" and str(resolved).lower() == "whatsapp.exe":
         return [resolve_executable("explorer.exe"), r"shell:AppsFolder\5319275A.WhatsAppDesktop_cv1g1gvanyjgm!App"]
+    app_id = _APPLICATION_SHELL_IDS.get(executable.lower())
+    if app_id and str(resolved).lower() == executable.lower():
+        return [resolve_executable("explorer.exe"), f"shell:AppsFolder\\{app_id}"]
     return [str(resolved), *command[1:]]
 
 
@@ -344,17 +577,53 @@ def resolve_executable(executable: str) -> str:
 
 
 def resolve_common_app_path(executable: str) -> Path | None:
-    if executable.lower() != "whatsapp.exe":
-        return None
+    executable_lower = executable.lower()
+    local_app_data = Path(os.environ.get("LocalAppData", ""))
+    program_files = Path(os.environ.get("ProgramFiles", ""))
+    program_files_x86 = Path(os.environ.get("ProgramFiles(x86)", ""))
 
-    candidates = [
-        Path(os.environ.get("LocalAppData", "")) / "WhatsApp" / "WhatsApp.exe",
-        Path(os.environ.get("ProgramFiles", "")) / "WindowsApps" / "5319275A.WhatsAppDesktop_cv1g1gvanyjgm" / "WhatsApp.exe",
-    ]
-    for path in candidates:
-        if path.exists():
-            return path
-    return None
+    candidates: dict[str, list[Path]] = {
+        "whatsapp.exe": [
+            local_app_data / "WhatsApp" / "WhatsApp.exe",
+            program_files / "WindowsApps" / "5319275A.WhatsAppDesktop_cv1g1gvanyjgm" / "WhatsApp.exe",
+        ],
+        "notion.exe": [local_app_data / "Programs" / "Notion" / "Notion.exe"],
+        "code.exe": [
+            local_app_data / "Programs" / "Microsoft VS Code" / "Code.exe",
+            program_files / "Microsoft VS Code" / "Code.exe",
+        ],
+        "githubdesktop.exe": [local_app_data / "GitHubDesktop" / "GitHubDesktop.exe"],
+        "outlook.exe": [
+            program_files / "Microsoft Office" / "root" / "Office16" / "OUTLOOK.EXE",
+            program_files_x86 / "Microsoft Office" / "root" / "Office16" / "OUTLOOK.EXE",
+        ],
+        "mongodbcompass.exe": [
+            local_app_data / "Programs" / "mongodb-compass" / "MongoDBCompass.exe",
+            program_files / "MongoDB Compass" / "MongoDBCompass.exe",
+        ],
+        "termius.exe": [
+            local_app_data / "Programs" / "Termius" / "Termius.exe",
+            program_files / "Termius" / "Termius.exe",
+        ],
+    }
+    existing = [path for path in candidates.get(executable_lower, []) if path.exists()]
+
+    versioned_roots: dict[str, Path] = {
+        "githubdesktop.exe": local_app_data / "GitHubDesktop",
+        "mongodbcompass.exe": local_app_data / "MongoDBCompass",
+    }
+    versioned_root = versioned_roots.get(executable_lower)
+    if versioned_root and versioned_root.exists():
+        existing.extend(
+            path
+            for path in versioned_root.glob(f"app-*/{executable}")
+            if path.exists()
+        )
+
+    if not existing:
+        return None
+    existing.sort(key=lambda path: path.stat().st_mtime, reverse=True)
+    return existing[0]
 
 
 def resolve_app_path(executable: str) -> Path | None:
