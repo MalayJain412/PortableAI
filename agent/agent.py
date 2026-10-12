@@ -93,6 +93,8 @@ Live state:
 
 Directories:
 - "folder" and "directory" mean the same thing.
+- A parent directory plus named subdirectories requires one create_directory call for the parent and one call for every child. Never treat the parent creation as completion of the whole request.
+- "create a directory test2 in workspace and inside it 2 subdirectories, dir1 and dir2" -> create_directory(path="test2"), create_directory(path="test2\\dir1"), create_directory(path="test2\\dir2").
 - Intent verbs are strict. create_directory requires an explicit create, make, mkdir, new-folder, or add-folder request. Never create for list, show, look, inspect, browse, contents, inside, folders, files, summarize, or tree requests.
 - delete_directory requires an explicit delete, remove, or erase verb. Never infer a destructive action from a read-only request.
 - create_directory and delete_directory are confined to the managed PortableAI workspace. Relative paths are based there.
@@ -466,19 +468,18 @@ class PortableAgent:
 
     async def _create_structured_plan(self, user_text: str, feedback: str) -> ToolPlan | None:
         history_text = render_history(self._recent_messages())
-        messages: list[BaseMessage] = [
-            SystemMessage(
-                content=(
-                    f"{SYSTEM_STRUCTURED_PLANNER}\n\n"
-                    f"JSON schema instructions:\n{self._planner_parser.get_format_instructions()}"
-                )
-            ),
+        system_sections = [
+            SYSTEM_STRUCTURED_PLANNER,
+            f"JSON schema instructions:\n{self._planner_parser.get_format_instructions()}",
         ]
         if history_text:
-            messages.append(SystemMessage(content=f"Recent conversation:\n{history_text}"))
+            system_sections.append(f"Recent conversation:\n{history_text}")
         if feedback:
-            messages.append(SystemMessage(content=f"Correct these validation errors: {feedback}"))
-        messages.append(HumanMessage(content=user_text))
+            system_sections.append(f"Correct these validation errors: {feedback}")
+        messages: list[BaseMessage] = [
+            SystemMessage(content="\n\n".join(system_sections)),
+            HumanMessage(content=user_text),
+        ]
 
         try:
             response = await self.chat_model.ainvoke(messages)
@@ -684,7 +685,61 @@ def reconcile_directory_actions(
                 )
             current = PlannedAction(tool=current.tool, arguments=arguments)
         reconciled.append(current)
+
+    required_creates = explicit_nested_directory_create_actions(user_text)
+    if required_creates:
+        reconciled = required_creates + [action for action in reconciled if action.tool != "create_directory"]
     return reconciled
+
+
+def explicit_nested_directory_create_actions(user_text: str) -> list[PlannedAction]:
+    if not DIRECTORY_CREATE_WORDS.search(user_text):
+        return []
+
+    children_match = re.search(
+        r"\b(?:inside\s+it|inside\s+(?:that|the)\s+(?:directory|folder)|with)\s+"
+        r"(?:create\s+|make\s+)?(?:\d+\s+)?"
+        r"(?:sub[\s-]*(?:directories|folders)|directories|folders)"
+        r"(?:\s+(?:named|called))?\s*[:,]?\s*(?P<children>.+?)\s*[.!?]*$",
+        user_text,
+        re.IGNORECASE,
+    )
+    if children_match is None:
+        return []
+
+    parent_match = re.search(
+        r"\b(?:create|make)\s+(?:a\s+)?(?:directory|folder)\s+"
+        r"(?:named\s+|called\s+)?(?P<parent>.+?)"
+        r"(?:\s+(?:in|inside)\s+(?:the\s+)?workspace)?(?:\s+and)?\s*$",
+        user_text[: children_match.start()],
+        re.IGNORECASE,
+    )
+    if parent_match is None:
+        return []
+
+    parent = clean_directory_segment(parent_match.group("parent"))
+    children = [
+        clean_directory_segment(value)
+        for value in re.split(r"\s*(?:,|\band\b)\s*", children_match.group("children"), flags=re.IGNORECASE)
+    ]
+    children = [child for child in children if child]
+    if not parent or len(children) < 2:
+        return []
+
+    return [
+        PlannedAction(tool="create_directory", arguments={"path": parent}),
+        *[
+            PlannedAction(tool="create_directory", arguments={"path": str(Path(parent) / child)})
+            for child in children
+        ],
+    ]
+
+
+def clean_directory_segment(value: str) -> str:
+    cleaned = value.strip().strip("\"'").rstrip(".,;:!? ")
+    if not cleaned or cleaned in {".", ".."} or any(separator in cleaned for separator in ("/", "\\")):
+        return ""
+    return cleaned
 
 
 def directory_read_action(action: PlannedAction, summarize: bool) -> PlannedAction:

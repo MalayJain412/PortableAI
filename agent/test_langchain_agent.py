@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
-from langchain_core.messages import AIMessage, AIMessageChunk
+from langchain_core.messages import AIMessage, AIMessageChunk, SystemMessage
 
 from agent import PortableAgent
 from langchain_tools import TOOL_REGISTRY
@@ -17,12 +17,14 @@ class FakeChatModel:
     def __init__(self, responses: list[AIMessage]) -> None:
         self.responses = list(responses)
         self.bound_tool_names: list[str] = []
+        self.seen_messages: list[list[Any]] = []
 
     def bind_tools(self, tools: list[Any]) -> "FakeChatModel":
         self.bound_tool_names = [item.name for item in tools]
         return self
 
     async def ainvoke(self, messages: list[Any]) -> AIMessage:
+        self.seen_messages.append(list(messages))
         if not self.responses:
             raise AssertionError("FakeChatModel has no response left.")
         return self.responses.pop(0)
@@ -726,6 +728,41 @@ class PortableAgentToolCallingTests(unittest.IsolatedAsyncioTestCase):
 
         create_directory.assert_called_once_with("new-project")
         self.assertIn("created directory new-project", result.content)
+
+    async def test_nested_create_request_restores_every_missing_subdirectory(self) -> None:
+        model = FakeChatModel([tool_response(("create_directory", {"path": "test2"}))])
+        agent = PortableAgent(chat_model=model, tool_calling_supported=True)
+        created: list[str] = []
+
+        def fake_create(path: str) -> dict[str, Any]:
+            created.append(path)
+            return {"ok": True, "relative_path": path, "created": True}
+
+        with patch("langchain_tools.windows_tools.create_directory", side_effect=fake_create):
+            result = await agent.handle(
+                "create a directory test2 in workspace and inside it 2 sub directories, dir1 and dir2"
+            )
+
+        self.assertEqual(created, ["test2", "test2\\dir1", "test2\\dir2"])
+        self.assertIn("created directory test2\\dir1", result.content)
+        self.assertIn("created directory test2\\dir2", result.content)
+
+    async def test_structured_fallback_keeps_one_leading_system_message(self) -> None:
+        first_plan = {"type": "answer", "content": "First answer.", "actions": []}
+        second_plan = {"type": "answer", "content": "Follow-up answer.", "actions": []}
+        model = FakeChatModel(
+            [AIMessage(content=json.dumps(first_plan)), AIMessage(content=json.dumps(second_plan))]
+        )
+        agent = PortableAgent(chat_model=model, tool_calling_supported=False)
+
+        await agent.handle("first question")
+        await agent.handle("follow-up question")
+
+        followup_messages = model.seen_messages[-1]
+        system_messages = [message for message in followup_messages if isinstance(message, SystemMessage)]
+        self.assertEqual(len(system_messages), 1)
+        self.assertIs(followup_messages[0], system_messages[0])
+        self.assertIn("Recent conversation:", str(system_messages[0].content))
 
     async def test_invalid_native_call_is_retried_before_execution(self) -> None:
         model = FakeChatModel(
