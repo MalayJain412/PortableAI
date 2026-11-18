@@ -49,13 +49,21 @@ STOP.bat
 ```text
 /help
 /tools
+/voice
+/text
+/listen
+/voice-status
 /clear
-  /cancel
+/cancel
 /exit
 ```
 
 - `/help` shows terminal commands.
 - `/tools` lists the available Windows tools.
+- `/voice` switches to hands-free Alexa wake-word input.
+- `/text` returns to keyboard input.
+- `/listen` waits for Alexa and captures one command without changing the current input mode.
+- `/voice-status` checks voice dependencies, model files, and the local audio server.
 - `/clear` clears the current chat memory and pending confirmations.
 - `/cancel` cancels a pending safety-sensitive plan.
 - `/exit` exits the terminal assistant.
@@ -69,6 +77,12 @@ PortableAI can answer normal chat questions using the local model server. It str
 - Time to first token
 - Total response time
 - Approximate tokens per second
+
+### Alexa Voice Input
+
+Type `/voice`, say **Alexa**, and then speak one command. Sentry records until two seconds of silence, transcribes the command locally with LFM3-Omni-2B through llama.cpp on port `8081`, and sends the resulting text through the same agent and tool-calling flow used by keyboard input.
+
+The wake word is currently fixed to `alexa`. Press `Ctrl+C` while Sentry is waiting for Alexa, or say **Alexa, switch to text mode**, to return to keyboard input. The audio server starts only when voice input is first used and is stopped when Sentry exits if Sentry launched it.
 
 ### Application Control
 

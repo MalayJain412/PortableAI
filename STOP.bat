@@ -7,7 +7,7 @@ if "%ROOT:~-1%"=="\" set "ROOT=%ROOT:~0,-1%"
 echo Stopping PortableAI model processes from:
 echo %ROOT%
 
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$root = '%ROOT%'; Get-Process | Where-Object { $_.Path -like ($root + '\models\Qwen3.5-0.8B-Q8_0.exe') } | Stop-Process -Force"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$root = '%ROOT%'; $targets = @($root + '\models\Qwen3.5-0.8B-Q8_0.exe', $root + '\runtime\llama.cpp\llama-server.exe', $root + '\open-wake-word-with-audio-pipeline\llama.cpp\llama-server.exe'); Get-Process | Where-Object { $_.Path -in $targets } | Stop-Process -Force"
 
 echo Done.
 pause

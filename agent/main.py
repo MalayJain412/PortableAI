@@ -7,21 +7,21 @@ import time
 
 from agent import PortableAgent
 from llm import GenerationMetrics, LlamafileClient
-from voice import OfflineVoiceInput, VoiceConfig, VoiceUnavailableError, available_vosk_models, normalize_voice_command, resolve_vosk_model_path, voice_dependencies_status
+from wake_voice import AlexaVoiceInput, VoiceUnavailableError, voice_runtime_status
 from windows_tools import initialize_sentry_window
 
-
-VOICE_ENABLED = False
 
 HELP_TEXT = """Commands:
   /help     Show this help
   /tools    List available Windows tools
+  /voice    Switch to Alexa wake-word input
+  /text     Switch to keyboard input
+  /listen   Wait for Alexa once, then remain in the current mode
+  /voice-status  Show Alexa voice runtime status
   /clear    Clear chat memory
   /cancel   Cancel a pending safety-sensitive plan
   /exit     Quit
 """
-
-VOICE_DISABLED_MESSAGE = "Voice input is disabled for now. Text mode is the supported input mode."
 
 
 class ResponseLoader:
@@ -131,35 +131,52 @@ async def run_chat() -> int:
     agent = PortableAgent(llm)
     await agent.initialize()
     input_mode = "text"
-    voice_engine = "auto"
-    voice_confirm = True
-    voice_input: OfflineVoiceInput | None = None
+    voice_input: AlexaVoiceInput | None = None
+
+    def close_voice_input() -> None:
+        nonlocal voice_input
+        if voice_input is not None:
+            voice_input.close()
+            voice_input = None
+
     while True:
-        try:
-            if input_mode == "voice":
-                print("\nYou [voice]: ", end="", flush=True)
+        if input_mode == "voice":
+            try:
                 if voice_input is None:
-                    voice_input = OfflineVoiceInput(VoiceConfig(engine=voice_engine))
-                try:
-                    user_text = voice_input.listen_once().strip()
-                except VoiceUnavailableError as exc:
-                    print(f"\nVoice input error: {exc}")
-                    print("Still in voice mode. Say /text to switch back, or try again.")
-                    continue
-                user_text = prepare_voice_text(user_text, voice_confirm)
-                if not user_text:
-                    continue
-                print(user_text)
-            else:
+                    voice_input = AlexaVoiceInput()
+                user_text = voice_input.listen_once().strip()
+            except KeyboardInterrupt:
+                input_mode = "text"
+                print("\nText mode enabled. Type /voice to listen for Alexa again.")
+                continue
+            except VoiceUnavailableError as exc:
+                print(f"\nVoice input error: {exc}")
+                close_voice_input()
+                input_mode = "text"
+                print("Returning to text mode.")
+                continue
+        else:
+            try:
                 user_text = input("\nYou: ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print("\nGoodbye.")
-            return 0
+            except (EOFError, KeyboardInterrupt):
+                close_voice_input()
+                print("\nGoodbye.")
+                return 0
 
         if not user_text:
             continue
-        command = user_text.lower()
+        command = user_text.casefold()
+        if input_mode == "voice" and command in {
+            "text mode",
+            "switch to text mode",
+            "use text mode",
+            "keyboard mode",
+        }:
+            input_mode = "text"
+            print("Text mode enabled.")
+            continue
         if command in {"/exit", "exit", "quit","by","bye","ok by", "ok bye","by by"}:
+            close_voice_input()
             print("Goodbye.")
             return 0
         if command == "/help":
@@ -169,44 +186,15 @@ async def run_chat() -> int:
             tools = await agent.tool_names()
             print("Tools: " + ", ".join(tools))
             continue
-        if is_voice_command(command) and not VOICE_ENABLED:
-            print(VOICE_DISABLED_MESSAGE)
-            continue
         if command == "/voice":
             try:
-                voice_input = OfflineVoiceInput(VoiceConfig(engine=voice_engine))
+                voice_input = voice_input or AlexaVoiceInput()
             except VoiceUnavailableError as exc:
                 print(f"Voice input unavailable: {exc}")
-                print("Try /voice-engine sphinx, or add a Vosk model under F:\\PortableAI\\models.")
                 continue
             input_mode = "voice"
-            print(f"Voice mode enabled using {voice_input.engine}. Say /text to switch back after a recognized utterance.")
-            continue
-        if command.startswith("/voice-engine"):
-            parts = command.split()
-            if len(parts) != 2:
-                print("Usage: /voice-engine auto|vosk|sphinx")
-                continue
-            voice_engine = parts[1]
-            voice_input = None
-            try:
-                probe = OfflineVoiceInput(VoiceConfig(engine=voice_engine))
-            except VoiceUnavailableError as exc:
-                print(f"Voice engine unavailable: {exc}")
-                continue
-            print(f"Voice engine set to {probe.engine}.")
-            voice_input = probe
-            continue
-        if command == "/voice-models":
-            models = available_vosk_models()
-            selected = resolve_vosk_model_path()
-            if not models:
-                print("No Vosk model folders found. Expected a folder like F:\\PortableAI\\models\\vosk-model-small-en-us-0.15")
-            else:
-                print("Vosk models:")
-                for model in models:
-                    marker = " [selected]" if selected and str(selected) == model else ""
-                    print(f"  {model}{marker}")
+            print("Alexa voice mode enabled. Say 'Alexa', then speak your command.")
+            print("Press Ctrl+C while waiting to return to text mode.")
             continue
         if command == "/text":
             input_mode = "text"
@@ -214,32 +202,32 @@ async def run_chat() -> int:
             continue
         if command == "/listen":
             try:
-                voice_input = voice_input or OfflineVoiceInput(VoiceConfig(engine=voice_engine))
-                spoken = voice_input.listen_once().strip()
+                voice_input = voice_input or AlexaVoiceInput()
+                user_text = voice_input.listen_once().strip()
+            except KeyboardInterrupt:
+                print("\nVoice listening cancelled.")
+                continue
             except VoiceUnavailableError as exc:
                 print(f"Voice input error: {exc}")
                 continue
-            user_text = prepare_voice_text(spoken, voice_confirm)
             if not user_text:
                 continue
-            print(f"You [voice]: {user_text}")
-            command = user_text.lower()
-            if not user_text:
-                continue
-        if command == "/confirm":
-            voice_confirm = not voice_confirm
-            print(f"Voice confirmation {'enabled' if voice_confirm else 'disabled'}.")
-            continue
+            command = user_text.casefold()
         if command == "/voice-status":
-            status = voice_dependencies_status()
+            status = voice_runtime_status()
             print(
                 "Voice dependencies: "
-                + ", ".join(f"{name}={'ok' if installed else 'missing'}" for name, installed in status.items())
+                + ", ".join(
+                    f"{name}={'ok' if installed else 'missing'}"
+                    for name, installed in status["dependencies"].items()
+                )
             )
-            selected_model = resolve_vosk_model_path()
-            print(f"Voice engine preference: {voice_engine}")
-            print(f"Voice confirmation: {'on' if voice_confirm else 'off'}")
-            print(f"Detected Vosk model: {selected_model if selected_model else 'none'}")
+            print(f"Wake word: {status['wake_word']}")
+            print(f"Audio server: {'ready' if status['audio_server_ready'] else 'stopped'}")
+            missing_files = [path for path, present in status["files"].items() if not present]
+            print("Voice files: " + ("ready" if not missing_files else "missing"))
+            for path in missing_files:
+                print(f"  {path}")
             continue
         if command == "/clear":
             agent.clear_history()
@@ -269,31 +257,9 @@ async def run_chat() -> int:
             print(result.content, end="", flush=True)
         print_metrics(result.metrics)
         if agent.exit_requested:
+            close_voice_input()
             print("Sentry is exiting so it cannot delay shutdown.")
             return 20
-
-
-def prepare_voice_text(spoken: str, confirm: bool) -> str:
-    normalized, confidence, source = normalize_voice_command(spoken)
-    print(f"\nHeard: {spoken}")
-    if normalized != spoken.strip():
-        print(f"Interpreted: {normalized} ({source}, confidence {confidence:.2f})")
-    if not confirm:
-        return normalized
-
-    answer = input("Send this command? [Y/n/edit]: ").strip()
-    if not answer or answer.lower() in {"y", "yes"}:
-        return normalized
-    if answer.lower() in {"n", "no"}:
-        print("Cancelled.")
-        return ""
-    return answer
-
-
-def is_voice_command(command: str) -> bool:
-    return command in {"/voice", "/text", "/listen", "/confirm", "/voice-status", "/voice-models"} or command.startswith(
-        "/voice-engine"
-    )
 
 
 def main() -> None:

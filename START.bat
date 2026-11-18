@@ -67,12 +67,12 @@ if errorlevel 1 (
   exit /b 1
 )
 
-"%PYTHON%" -c "import langchain, langchain_openai, langgraph, mcp, httpx, psutil, win32api" >nul 2>&1
+"%PYTHON%" -c "import langchain, langchain_openai, langgraph, mcp, httpx, psutil, win32api, numpy, scipy, sounddevice, openwakeword, onnxruntime" >nul 2>&1
 if errorlevel 1 (
   echo Required Python packages are missing from the portable runtime.
   echo Installing them into the USB drive. This needs an internet connection...
   "%UV%" pip install -r "%ROOT%\agent\requirements.txt" --python "%PYTHON%"
-  "%PYTHON%" -c "import langchain, langchain_openai, langgraph, mcp, httpx, psutil, win32api"
+  "%PYTHON%" -c "import langchain, langchain_openai, langgraph, mcp, httpx, psutil, win32api, numpy, scipy, sounddevice, openwakeword, onnxruntime"
   if errorlevel 1 (
     echo.
     echo Package installation failed. Connect to the internet and run START.bat again.
