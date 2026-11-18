@@ -50,12 +50,14 @@ STOP.bat
 /help
 /tools
 /clear
+  /cancel
 /exit
 ```
 
 - `/help` shows terminal commands.
 - `/tools` lists the available Windows tools.
 - `/clear` clears the current chat memory and pending confirmations.
+- `/cancel` cancels a pending safety-sensitive plan.
 - `/exit` exits the terminal assistant.
 
 ## Core Capabilities
@@ -124,6 +126,7 @@ Capabilities:
 - Append text to the managed note
 - Report the saved path
 - Save the managed note under a simple `.txt` filename
+- Reopen the same active managed note
 - Close Notepad windows
 
 Examples:
@@ -260,6 +263,67 @@ Delete the projects\demo directory
 
 Deletion is recursive and always requires confirmation in chat before the delete action runs.
 
+## Managed Files
+
+PortableAI can rename, copy, move/cut, and delete files inside these controlled locations:
+
+- `workspace`
+- `cache\notepad`
+
+File changes outside those folders are rejected. Existing destination files are not overwritten unless the user explicitly asks to overwrite or replace them. File deletion always requires confirmation.
+
+Examples:
+
+```text
+Rename "F:\PortableAI\cache\notepad\portable_ai_current_note.txt" as nagpur-expenses
+```
+
+```text
+Copy expenses.txt to backup\expenses.txt
+```
+
+```text
+Cut expenses.txt to archive
+```
+
+```text
+Delete the file old-expenses.txt
+```
+
+`cut` and `move` use the same move operation. Renaming a file without specifying a new extension preserves its current extension.
+
+## Power And Session Commands
+
+Sentry provides four guarded power routines:
+
+```text
+Good Night
+Tata
+Shutdown
+Deep Sleep
+Sleep
+Lock
+```
+
+- `Good Night`, `GoodNight`, `Tata`, and exact shutdown commands ask for confirmation, gracefully close every visible user application except the Sentry terminal, then request a non-forced shutdown.
+- `Deep Sleep` asks for confirmation, gracefully closes the same visible applications, then sleeps the laptop.
+- Exact `Sleep` or `Normal Sleep` commands sleep immediately without closing applications.
+- Exact `Lock` or `Hide` commands lock Windows immediately without closing applications.
+
+Close-all uses normal window close messages and never force-terminates a process. If an application remains open, for example because it is showing an unsaved-work prompt, the dependent sleep or shutdown action is cancelled. Explorer folder windows and other terminal windows are included; the exact Sentry terminal and essential Windows shell windows are protected.
+
+At startup, Sentry resolves the visible top-level terminal host rather than trusting the hidden pseudo-console handle used by Windows Terminal. Before close-all sends any window message, it verifies that this visible host is present in the protected set. If verification fails, nothing is closed and the dependent power action is blocked.
+
+After Windows accepts shutdown, the agent exits with a dedicated launcher code. `START.bat` detects it and exits immediately without reaching its normal `pause`, so the Sentry console does not remain waiting for input.
+
+Validated plans and their action-by-action statuses are audited in:
+
+```text
+cache\agent_state.db
+```
+
+Interrupted plans are marked as interrupted on the next launch and are never resumed automatically.
+
 ## Tool Decision Flow
 
 For each user message, the agent decides whether the request is normal chat or a tool action.
@@ -288,6 +352,8 @@ Important safety constraints:
 - Only allowlisted desktop applications can be opened or closed.
 - URLs must use `http://` or `https://`.
 - Directory creation and deletion are limited to the managed workspace.
+- File rename, copy, move, and delete are limited to the workspace and managed Notepad folder.
+- Existing files cannot be overwritten unless overwrite or replacement is explicitly requested.
 - The managed workspace root cannot be deleted.
 - Symbolic links and directory junctions are rejected in managed paths.
 - Network and device paths are blocked for directory inspection.
@@ -295,7 +361,11 @@ Important safety constraints:
 - Notepad filenames must be simple filenames, not paths.
 - Notepad text length is capped.
 - Clipboard reads are truncated to a configured limit.
-- Destructive directory deletion requires confirmation.
+- Destructive file and directory deletion requires confirmation.
+- Close-all and shutdown routines require confirmation.
+- Model-inferred sleep requests require confirmation; exact `Sleep` and `Normal Sleep` aliases do not.
+- Shutdown is never forced, and it is cancelled if the close-all prerequisite fails.
+- Lock, sleep, and shutdown tools are intentionally not exposed through the optional raw MCP server because that path has no trusted confirmation UI.
 
 ## Project Structure
 
@@ -309,6 +379,19 @@ PortableAI
 `-- agent
     |-- main.py
     |-- agent.py
+    |-- prompts.py
+    |-- prompts
+    |   |-- identity.md
+    |   |-- tool_catalog.md
+    |   |-- tool_execution_guide.md
+    |   |-- system_tool_agent.md
+    |   |-- system_structured_planner.md
+    |   |-- system_natural_answer.md
+    |   |-- tool_calling_probe_system.md
+    |   |-- tool_calling_probe_user.md
+    |   |-- native_tool_call_retry.md
+    |   `-- structured_plan_retry.md
+    |-- plan_store.py
     |-- llm.py
     |-- config.py
     |-- security.py
@@ -316,10 +399,14 @@ PortableAI
     |-- langchain_tools.py
     |-- mcp_server.py
     |-- requirements.txt
-    |-- test_tools.py
-    |-- test_directory_tools.py
-    |-- test_langchain_agent.py
-    `-- test_windows_close.py
+    `-- tests
+        |-- __init__.py
+        |-- test_tools.py
+        |-- test_directory_tools.py
+        |-- test_file_tools.py
+        |-- test_langchain_agent.py
+        |-- test_plan_store.py
+        `-- test_windows_close.py
 ```
 
 Main files:
@@ -328,6 +415,9 @@ Main files:
 - `STOP.bat` stops the local model server process.
 - `agent/main.py` contains the terminal chat loop.
 - `agent/agent.py` contains the planner, confirmation flow, memory handling, action reconciliation, and result summaries.
+- `agent/prompts/` holds every prompt sent to the model as a separate Markdown file. `identity.md` sets the assistant's name (Sentry), maker (Portable AI), and developer (Malay Jain) for all system prompts. `{{name}}` marks a value filled in at runtime, such as `{{tool_execution_guide}}` or `{{validation_errors}}`. Edits take effect the next time the agent starts.
+- `agent/prompts.py` loads those files and fills in their placeholders.
+- `agent/plan_store.py` stores the persistent SQLite execution checklist and audit states.
 - `agent/llm.py` talks to the local `llamafile` OpenAI-compatible API.
 - `agent/windows_tools.py` contains the actual Windows automation functions.
 - `agent/langchain_tools.py` wraps Windows functions as LangChain tools with schemas.
@@ -359,7 +449,9 @@ The launcher expects a portable Python virtual environment at:
 runtime\venv\Scripts\python.exe
 ```
 
-If required packages are missing, `START.bat` prints an install command using the bundled `tools\uv.exe`.
+The venv records its base interpreter (`runtime\python\cpython-3.12.*`) as an absolute path in `runtime\venv\pyvenv.cfg`, including the drive letter. Windows can assign the USB drive a different letter on each PC, so `START.bat` rewrites that `home =` line to the current drive on every launch. It also clears `PYTHONHOME`/`PYTHONPATH` so a Python installed on the host PC cannot interfere.
+
+If required packages are missing, `START.bat` installs them into the venv with the bundled `tools\uv.exe` (internet required), keeping uv's cache in `cache\uv` on the drive.
 
 ## Testing
 
@@ -369,18 +461,31 @@ The repo includes tests for:
 - App allowlist enforcement
 - Directory path validation
 - Directory create/list/summarize/delete behavior
+- Managed file rename/copy/move/delete behavior
 - Planner action repair and confirmation flow
 - Compound command ordering
 - Window close settling behavior
 
-Test files:
+Test files live in `agent\tests\`:
 
 ```text
-agent\test_tools.py
-agent\test_directory_tools.py
-agent\test_langchain_agent.py
-agent\test_windows_close.py
+agent\tests\test_tools.py
+agent\tests\test_directory_tools.py
+agent\tests\test_file_tools.py
+agent\tests\test_langchain_agent.py
+agent\tests\test_plan_store.py
+agent\tests\test_windows_close.py
 ```
+
+`agent\tests\__init__.py` adds the `agent` folder to the import path, so run tests as modules from the `agent` folder:
+
+```bat
+cd agent
+..\runtime\venv\Scripts\python.exe -m unittest
+..\runtime\venv\Scripts\python.exe -m unittest tests.test_plan_store
+```
+
+`test_tools.py` is a manual check rather than a unittest suite. It touches the real clipboard and can open applications. Run it with `..\runtime\venv\Scripts\python.exe -m tests.test_tools` from the `agent` folder.
 
 ## Notes
 

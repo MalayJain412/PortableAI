@@ -19,127 +19,38 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
+from config import AGENT_STATE_DB
 from langchain_tools import LANGCHAIN_TOOLS
 from llm import GenerationMetrics, LLMResult, LlamafileClient, TokenCallback, estimate_tokens
+from plan_store import PlanStore
+from prompts import load_prompt
 
 
 MAX_ACTIONS = 8
 MAX_HISTORY_MESSAGES = 12
-CONFIRMATION_REQUIRED_TOOLS = frozenset({"delete_directory"})
+CONFIRMATION_REQUIRED_TOOLS = frozenset(
+    {"delete_directory", "delete_file", "close_all_visible_applications", "shutdown_computer"}
+)
+POWER_TOOLS = frozenset({"sleep_computer", "shutdown_computer", "lock_computer"})
+TERMINAL_POWER_TOOLS = frozenset({"sleep_computer", "shutdown_computer"})
 
-TOOL_CATALOG = """Available tools (each call performs one atomic action):
-- open_application(application): open one allowlisted application.
-- close_application(application): close all visible windows of one allowlisted application.
-- list_application_windows(application): inspect current visible windows for one application.
-- open_url(url): open one explicitly requested HTTP or HTTPS destination in the default browser.
-- youtube_search_open(query): find and open one specific YouTube video, playlist, or channel.
-- open_notepad_with_text(text): create and open a one-shot Notepad note with exact text.
-- notepad_open(text): open the managed note, optionally replacing it with starting text.
-- notepad_type(text): append exact text to the managed note.
-- notepad_save(): report the managed note's current saved path.
-- notepad_save_as(filename): save the managed note under a simple filename.
-- notepad_close(): close visible Notepad windows.
-- list_processes(): list running processes.
-- system_information(): read basic local system information.
-- active_window(): inspect the current foreground window.
-- clipboard_read(): read text from the clipboard.
-- clipboard_write(text): write exact text to the clipboard.
-- create_directory(path): create a directory inside the managed PortableAI workspace.
-- delete_directory(path): permanently delete a directory tree inside the managed workspace.
-- list_directory(path, recursive, include, output_format): list entries in any existing local directory from names and metadata only.
-- summarize_directory(path): summarize any existing local directory from counts, sizes, and file types only.
-"""
-
-TOOL_EXECUTION_GUIDE = """Plan Windows tasks with this exact workflow:
-
-1. SPLIT: Divide the request into ordered clauses at words such as "and", "then", and commas.
-2. INTERPRET: For each clause, identify its own action, target, and arguments. A later explicit verb replaces the earlier verb. A clause with no verb inherits the previous clause's verb.
-3. MAP: Select one tool for every requested target. Keep all actions in user order.
-4. DEPENDENCIES: Open a named browser before its URL. For Notepad, open/write before save and save before close.
-5. AUDIT: Before responding, verify that every clause and every named target has exactly one appropriate action. Do not drop, duplicate, reverse, or change an action.
-
-Mixed verbs are independent:
-- "close Chrome and open WhatsApp" -> close_application(chrome), open_application(whatsapp)
-- "open Chrome and close WhatsApp" -> open_application(chrome), close_application(whatsapp)
-- "close Chrome and WhatsApp" -> close_application(chrome), close_application(whatsapp), because the second clause inherits "close"
-- "close Chrome, then open Chrome" -> close_application(chrome), open_application(chrome)
-
-Navigation:
-- "open chatgpt.com on Chrome, and WhatsApp" -> open_application(chrome), open_url(https://chatgpt.com), open_application(whatsapp)
-- "open YouTube on Chrome" -> open_application(chrome), open_url(https://youtube.com)
-- "search for LangChain on Google" -> open_url(https://www.google.com/search?q=LangChain)
-- "open LangChain on Google" means search Google for LangChain and uses the same search URL.
-- A literal website or YouTube home is navigation with open_url.
-- A specific YouTube video, playlist, channel, or content request uses youtube_search_open.
-- Browser navigation is opt-in. Use open_url only when the user explicitly supplies a URL/domain, asks to open a link/website/page, names a web destination followed by "on/in Chrome" or "in the browser", or asks to search on Google/Chrome/the web.
-- Never open Google, a website, or a search page as a fallback for an application request. "open Chrome" means open_application(chrome) only. "open Notion and Chrome" means two open_application calls and no URL.
-- Do not invent a URL, search query, website, or browser action that the user did not request.
-- Never say that a page was opened or a search was performed without emitting the corresponding tool call and receiving its result.
-
-Desktop applications:
-- A named allowlisted app means the installed desktop application by default. "open Notion" and "open Notion on laptop" both use open_application(notion).
-- Use a website only when the user explicitly requests web navigation. "open the Notion website" and "open Notion on Chrome" may use open_url; plain "open Notion" must not.
-- Never replace an open-app request with active_window, list_processes, or a similarly unrelated inspection tool.
-- Interpret VS Code or Visual Studio Code as vscode, GitHub Desktop as github_desktop, MongoDB Compass as mongodb_compass, and Termius as termius.
-
-Notepad:
-- A one-shot open-and-write request uses open_notepad_with_text.
-- A request that also saves or closes uses notepad_open with text, then save, then close.
-- Treat "note pad" as "notepad" when the meaning is clear.
-
-Live state:
-- "is WhatsApp still open?" uses list_application_windows(whatsapp).
-- Never infer current window state from conversation history or an earlier result.
-
-Directories:
-- "folder" and "directory" mean the same thing.
-- A parent directory plus named subdirectories requires one create_directory call for the parent and one call for every child. Never treat the parent creation as completion of the whole request.
-- "create a directory test2 in workspace and inside it 2 subdirectories, dir1 and dir2" -> create_directory(path="test2"), create_directory(path="test2\\dir1"), create_directory(path="test2\\dir2").
-- Intent verbs are strict. create_directory requires an explicit create, make, mkdir, new-folder, or add-folder request. Never create for list, show, look, inspect, browse, contents, inside, folders, files, summarize, or tree requests.
-- delete_directory requires an explicit delete, remove, or erase verb. Never infer a destructive action from a read-only request.
-- create_directory and delete_directory are confined to the managed PortableAI workspace. Relative paths are based there.
-- list_directory and summarize_directory may inspect any existing local drive directory. They never read file contents and never accept network paths.
-- Convert a drive phrase to an absolute root path: "E drive" means path="E:\\". Do not treat it as a folder named "E drive" inside the workspace.
-- Extract the complete requested path and preserve its words, spaces, hyphens, and nested separators. Remove only command wording, a leading "the", and a trailing "folder" or "directory" label.
-- Never use path . when the user names a folder. Use . only when the user explicitly means the workspace root or gives no narrower path.
-- "create a projects folder" -> create_directory(path="projects").
-- "create a folder named client work" -> create_directory(path="client work").
-- "show/list what is in projects" -> list_directory(path="projects", recursive=false, include="all", output_format="compact").
-- "look inside the projects directory and list all its folders and files" -> list_directory(path="projects", recursive=false, include="all").
-- "what are the folders in E drive?" -> list_directory(path="E:\\", recursive=false, include="directories", output_format="compact").
-- After that result, "list them in a tree format" keeps path="E:\\", recursive=false, include="directories" and changes only output_format="tree".
-- "what files are in E drive?" -> list_directory(path="E:\\", recursive=false, include="files", output_format="compact").
-- "show every nested item in projects" -> list_directory(path="projects", recursive=true, include="all").
-- Resolve a named child against the most recently listed directory. If E:\\GPT-mini listed "Makemoer Series", then "list contents of Makemore Series" means list_directory(path="E:\\GPT-mini\\Makemoer Series", recursive=false, include="all", output_format="compact"), never create_directory.
-- "summarize the projects directory" -> summarize_directory(path="projects").
-- "delete the old archive directory" -> delete_directory(path="old archive").
-- "summarize the projects directory and delete the old archive directory" -> summarize_directory(path="projects"), delete_directory(path="old archive").
-- Emit delete_directory normally; the host requests confirmation before running the complete schedule.
-- Use one directory tool call for every requested path. Never read file contents to summarize a directory.
-
-Safety and output:
-- Canonical applications: notepad, calculator, calc, chrome, whatsapp, notion, vscode, github_desktop, outlook, mongodb_compass, termius.
-- Use only provided tools and their exact argument names. Never invent an application, URL, tool, or argument.
-- If a target is unsupported, explain the allowlist instead of substituting another target.
-- If intent is genuinely ambiguous, ask one short confirmation question and call no tool.
-- For ordinary conversation with no tool intent, answer naturally and concisely.
-- Never claim success before receiving tool results.
-- Maximum eight actions.
-"""
-
-SYSTEM_TOOL_AGENT = f"""You are Portable AI, a local offline Windows assistant with allowlisted tools.
-The host provides each available tool's description and exact argument schema. When a request needs tools, silently build the complete schedule using the workflow below, then emit all required tool calls in one response. The host validates the full schedule and executes it sequentially.
-
-{TOOL_EXECUTION_GUIDE}
-"""
-
-SYSTEM_STRUCTURED_PLANNER = f"""You are the structured action planner for Portable AI.
-Return only data matching the supplied JSON schema. Use type "tools" for an executable schedule, "confirm" for a proposed schedule that needs confirmation, or "answer" when no tool should run.
-
-{TOOL_CATALOG}
-
-{TOOL_EXECUTION_GUIDE}
-"""
+ASSISTANT_IDENTITY = load_prompt("identity")
+TOOL_CATALOG = load_prompt("tool_catalog")
+TOOL_EXECUTION_GUIDE = load_prompt("tool_execution_guide")
+SYSTEM_TOOL_AGENT = load_prompt(
+    "system_tool_agent",
+    assistant_identity=ASSISTANT_IDENTITY,
+    tool_execution_guide=TOOL_EXECUTION_GUIDE,
+)
+SYSTEM_STRUCTURED_PLANNER = load_prompt(
+    "system_structured_planner",
+    assistant_identity=ASSISTANT_IDENTITY,
+    tool_catalog=TOOL_CATALOG,
+    tool_execution_guide=TOOL_EXECUTION_GUIDE,
+)
+SYSTEM_NATURAL_ANSWER = load_prompt("system_natural_answer", assistant_identity=ASSISTANT_IDENTITY)
+TOOL_CALLING_PROBE_SYSTEM = load_prompt("tool_calling_probe_system")
+TOOL_CALLING_PROBE_USER = load_prompt("tool_calling_probe_user")
 
 APPLICATION_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"\bgithub\s*desktop\b", re.IGNORECASE), "github_desktop"),
@@ -230,7 +141,48 @@ DIRECTORY_RECURSIVE_WORDS = re.compile(
     r"\b(?:recursive|recursively|nested)\b|\b(?:all|every)\s+levels?\b|\b(?:entire|whole)\s+tree\b",
     re.IGNORECASE,
 )
-DIRECTORY_FOLLOWUP_WORDS = re.compile(r"\b(?:it|its|them|those|these|same)\b", re.IGNORECASE)
+DIRECTORY_FOLLOWUP_WORDS = re.compile(
+    r"\b(?:it|its|them|those|these|same|actual|current)\b",
+    re.IGNORECASE,
+)
+FILE_RENAME_WORDS = re.compile(
+    r"\b(?:rename|change\s+(?:the\s+)?file\s*name|edit\s+(?:the\s+)?file\s*name)\b",
+    re.IGNORECASE,
+)
+FILE_COPY_WORDS = re.compile(r"\b(?:copy|duplicate)\b", re.IGNORECASE)
+FILE_MOVE_WORDS = re.compile(r"\b(?:move|cut)\b", re.IGNORECASE)
+FILE_DELETE_WORDS = re.compile(r"\b(?:delete|remove|erase)\b", re.IGNORECASE)
+FILE_OVERWRITE_WORDS = re.compile(r"\b(?:overwrite|replace)\b", re.IGNORECASE)
+NOTEPAD_WRITE_WORDS = re.compile(r"\b(?:write|type|add|insert|put)\b", re.IGNORECASE)
+NOTEPAD_SAVE_WORDS = re.compile(r"\bsave\b", re.IGNORECASE)
+POWER_NEGATION_WORDS = re.compile(
+    r"\b(?:do\s+not|don't|dont|never)\b.{0,40}"
+    r"\b(?:shutdown|shut\s+down|sleep|suspend|lock|close)\b",
+    re.IGNORECASE,
+)
+POWER_DISCUSSION_WORDS = re.compile(
+    r"^\s*(?:how|why|what|when|where|should\s+i|can\s+i|could\s+i|"
+    r"does|is\s+it)\b|\bhow\s+to\b|\b(?:explain|describe)\b",
+    re.IGNORECASE,
+)
+CLOSE_ALL_REQUEST = re.compile(
+    r"\bclose\s+(?:all|every)\s+(?:open\s+)?(?:applications?|apps?|windows?)\b",
+    re.IGNORECASE,
+)
+SHUTDOWN_REQUEST = re.compile(
+    r"\b(?:shutdown|shut\s+down|turn\s+off|power\s+off)\s+"
+    r"(?:my\s+|the\s+|this\s+)?(?:laptop|computer|pc|machine|windows)\b",
+    re.IGNORECASE,
+)
+SLEEP_REQUEST = re.compile(
+    r"\b(?:(?:put|send)\s+(?:my\s+|the\s+|this\s+)?(?:laptop|computer|pc|machine|windows)\s+to\s+sleep|"
+    r"(?:sleep|suspend)\s+(?:my\s+|the\s+|this\s+)?(?:laptop|computer|pc|machine|windows))\b",
+    re.IGNORECASE,
+)
+LOCK_REQUEST = re.compile(
+    r"\block\s+(?:my\s+|the\s+|this\s+)?(?:laptop|computer|pc|machine|windows|screen|workstation)\b",
+    re.IGNORECASE,
+)
 CLAUSE_SEPARATOR = re.compile(
     r"\s*(?:,\s*(?:and\s+)?|;\s*|\b(?:and\s+then|then|and)\b)\s*",
     re.IGNORECASE,
@@ -273,8 +225,11 @@ def portable_ai_tool_probe(value: Literal["ready"]) -> str:
 
 @dataclass(frozen=True)
 class PendingConfirmation:
+    plan_id: str
     user_text: str
     actions: list[PlannedAction]
+    intent: str
+    source: str
 
 
 @dataclass(frozen=True)
@@ -298,6 +253,7 @@ class PortableAgent:
         chat_model: Any | None = None,
         tools: list[BaseTool] | None = None,
         tool_calling_supported: bool | None = None,
+        plan_store: PlanStore | None = None,
     ) -> None:
         self.llm = llm or LlamafileClient()
         self.chat_model = chat_model or ChatOpenAI(
@@ -314,8 +270,10 @@ class PortableAgent:
         self._memory = InMemorySaver()
         self._memory_graph = build_memory_graph(self._memory)
         self._memory_config = {"configurable": {"thread_id": "portable-ai-session"}}
+        self.plan_store = plan_store or PlanStore(AGENT_STATE_DB)
         self.pending_confirmation: PendingConfirmation | None = None
         self.directory_context: DirectoryContext | None = None
+        self.exit_requested = False
         self._tool_calling_supported = tool_calling_supported
         self._bound_model: Any | None = None
         self._planner_parser = PydanticOutputParser(pydantic_object=ToolPlan)
@@ -329,6 +287,8 @@ class PortableAgent:
 
     def clear_history(self) -> None:
         self._memory.delete_thread("portable-ai-session")
+        if self.pending_confirmation is not None:
+            self.plan_store.cancel_plan(self.pending_confirmation.plan_id)
         self.pending_confirmation = None
         self.directory_context = None
 
@@ -337,6 +297,20 @@ class PortableAgent:
         pending_result = await self._handle_pending_confirmation(user_text, started_at)
         if pending_result is not None:
             return pending_result
+
+        alias_plan = exact_power_alias_plan(user_text)
+        if alias_plan is not None:
+            intent, actions = alias_plan
+            prepared, error = self._validate_actions(actions)
+            if prepared is None:
+                return measured_result(f"I could not prepare that power routine: {error}", started_at)
+            return await self._execute_or_confirm(
+                user_text,
+                prepared,
+                started_at,
+                intent=intent,
+                source="exact_alias",
+            )
 
         if await self._supports_native_tool_calls():
             native_result = await self._handle_native(user_text, on_token, started_at)
@@ -353,8 +327,8 @@ class PortableAgent:
             probe_model = self.chat_model.bind_tools([portable_ai_tool_probe])
             response = await probe_model.ainvoke(
                 [
-                    SystemMessage(content="You are testing OpenAI-compatible tool calling."),
-                    HumanMessage(content="Call portable_ai_tool_probe now with value ready. Do not answer in text."),
+                    SystemMessage(content=TOOL_CALLING_PROBE_SYSTEM),
+                    HumanMessage(content=TOOL_CALLING_PROBE_USER),
                 ]
             )
             calls = getattr(response, "tool_calls", None) or []
@@ -385,10 +359,7 @@ class PortableAgent:
             if validation_feedback:
                 attempt_messages.append(
                     HumanMessage(
-                        content=(
-                            "Your proposed tool calls were invalid. Correct every issue and return a complete replacement "
-                            f"set of tool calls. Validation errors: {validation_feedback}"
-                        )
+                        content=load_prompt("native_tool_call_retry", validation_errors=validation_feedback)
                     )
                 )
             response = await model.ainvoke(attempt_messages)
@@ -455,12 +426,13 @@ class PortableAgent:
                 continue
 
             if plan.type == "confirm":
-                self.pending_confirmation = PendingConfirmation(user_text=user_text, actions=prepared)
-                if requires_confirmation(prepared):
-                    content = destructive_confirmation_prompt(prepared)
-                else:
-                    content = plan.content.strip() or confirmation_prompt(prepared)
-                return measured_result(content, started_at)
+                return await self._execute_or_confirm(
+                    user_text,
+                    prepared,
+                    started_at,
+                    force_confirmation=True,
+                    confirmation_text=plan.content.strip() or None,
+                )
 
             return await self._execute_or_confirm(user_text, prepared, started_at)
 
@@ -475,7 +447,7 @@ class PortableAgent:
         if history_text:
             system_sections.append(f"Recent conversation:\n{history_text}")
         if feedback:
-            system_sections.append(f"Correct these validation errors: {feedback}")
+            system_sections.append(load_prompt("structured_plan_retry", validation_errors=feedback))
         messages: list[BaseMessage] = [
             SystemMessage(content="\n\n".join(system_sections)),
             HumanMessage(content=user_text),
@@ -514,6 +486,14 @@ class PortableAgent:
 
         if errors:
             return None, " ".join(errors)
+
+        terminal_indexes = [
+            index for index, action in enumerate(prepared) if action.tool in TERMINAL_POWER_TOOLS
+        ]
+        if len(terminal_indexes) > 1:
+            return None, "A plan may contain only one sleep or shutdown action."
+        if terminal_indexes and terminal_indexes[0] != len(prepared) - 1:
+            return None, "Sleep or shutdown must be the final action in the plan."
         return prepared, ""
 
     def _reconcile_actions(
@@ -522,27 +502,90 @@ class PortableAgent:
         actions: list[PlannedAction],
     ) -> list[PlannedAction]:
         explicit_actions = reconcile_explicit_actions(user_text, actions)
-        return reconcile_directory_actions(user_text, explicit_actions, self.directory_context)
+        notepad_actions = reconcile_notepad_actions(user_text, explicit_actions)
+        directory_actions = reconcile_directory_actions(
+            user_text,
+            notepad_actions,
+            self.directory_context,
+        )
+        file_actions = reconcile_file_actions(user_text, directory_actions)
+        return reconcile_power_actions(user_text, file_actions)
 
     async def _execute_and_report(
         self,
         user_text: str,
         actions: list[PlannedAction],
         started_at: float,
+        plan_id: str,
     ) -> LLMResult:
         results: list[dict[str, Any]] = []
-        for action in actions:
+        close_all_failed = False
+        shutdown_dispatched = False
+        self.plan_store.start_plan(plan_id)
+        for sequence, action in enumerate(actions):
+            requires_previous_success = (
+                action.tool in TERMINAL_POWER_TOOLS
+                and any(previous.tool == "close_all_visible_applications" for previous in actions[:sequence])
+            )
+            if requires_previous_success and close_all_failed:
+                error = "Skipped because an earlier close-all action did not complete successfully"
+                results.append({"tool": action.tool, "ok": False, "error": error})
+                self.plan_store.finish_action(
+                    plan_id,
+                    sequence,
+                    status="blocked",
+                    error=error,
+                )
+                continue
+
             selected_tool = self.tool_registry[action.tool]
+            self.plan_store.start_action(plan_id, sequence)
             try:
                 output = await selected_tool.ainvoke(action.arguments)
                 output_ok = output.get("ok", True) if isinstance(output, dict) else True
                 results.append({"tool": action.tool, "ok": bool(output_ok), "result": output})
                 if output_ok and isinstance(output, dict):
                     self._remember_directory_result(action, output)
+                action_status = "succeeded" if output_ok else "failed"
+                if (
+                    action.tool == "shutdown_computer"
+                    and output_ok
+                    and isinstance(output, dict)
+                    and output.get("dispatched")
+                ):
+                    action_status = "dispatched"
+                    shutdown_dispatched = True
+                    self.exit_requested = True
+                self.plan_store.finish_action(
+                    plan_id,
+                    sequence,
+                    status=action_status,
+                    result=output,
+                    error=None if output_ok else str(output.get("message") or "Tool reported failure"),
+                )
+                if action.tool == "close_all_visible_applications" and not output_ok:
+                    close_all_failed = True
             except Exception as exc:
-                results.append({"tool": action.tool, "ok": False, "error": str(exc)})
+                error = str(exc)
+                results.append({"tool": action.tool, "ok": False, "error": error})
+                self.plan_store.finish_action(
+                    plan_id,
+                    sequence,
+                    status="failed",
+                    error=error,
+                )
+                if action.tool == "close_all_visible_applications":
+                    close_all_failed = True
 
         content = summarize_tool_results(results)
+        failed = any(not bool(item.get("ok")) for item in results)
+        final_status = "failed" if failed else "dispatched" if shutdown_dispatched else "completed"
+        self.plan_store.finish_plan(
+            plan_id,
+            status=final_status,
+            summary=content,
+            error="One or more planned actions failed." if failed else None,
+        )
         self._remember(user_text, content)
         return measured_result(content, started_at)
 
@@ -575,11 +618,44 @@ class PortableAgent:
         user_text: str,
         actions: list[PlannedAction],
         started_at: float,
+        *,
+        intent: str = "tool_request",
+        source: str = "llm",
+        force_confirmation: bool = False,
+        confirmation_text: str | None = None,
     ) -> LLMResult:
-        if requires_confirmation(actions):
-            self.pending_confirmation = PendingConfirmation(user_text=user_text, actions=actions)
-            return measured_result(destructive_confirmation_prompt(actions), started_at)
-        return await self._execute_and_report(user_text, actions, started_at)
+        confirmation_required = force_confirmation or requires_confirmation(actions, source, intent)
+        stored_plan = self.plan_store.create_plan(
+            user_text=user_text,
+            intent=intent,
+            source=source,
+            actions=[
+                {
+                    "tool": action.tool,
+                    "arguments": action.arguments,
+                    "requires_previous_success": (
+                        action.tool in TERMINAL_POWER_TOOLS
+                        and any(
+                            previous.tool == "close_all_visible_applications"
+                            for previous in actions[:index]
+                        )
+                    ),
+                }
+                for index, action in enumerate(actions)
+            ],
+            confirmation_required=confirmation_required,
+        )
+        if confirmation_required:
+            self.pending_confirmation = PendingConfirmation(
+                plan_id=stored_plan.plan_id,
+                user_text=user_text,
+                actions=actions,
+                intent=intent,
+                source=source,
+            )
+            content = confirmation_text or safety_confirmation_prompt(actions, intent)
+            return measured_result(content, started_at)
+        return await self._execute_and_report(user_text, actions, started_at, stored_plan.plan_id)
 
     async def _handle_pending_confirmation(
         self,
@@ -593,13 +669,22 @@ class PortableAgent:
         answer = confirmation_answer(user_text)
         if answer is True:
             self.pending_confirmation = None
-            return await self._execute_and_report(pending.user_text, pending.actions, started_at)
+            self.plan_store.confirm_plan(pending.plan_id)
+            return await self._execute_and_report(
+                pending.user_text,
+                pending.actions,
+                started_at,
+                pending.plan_id,
+            )
         if answer is False:
             self.pending_confirmation = None
+            self.plan_store.cancel_plan(pending.plan_id)
             return measured_result("No problem. I cancelled that action.", started_at)
 
-        self.pending_confirmation = None
-        return None
+        return measured_result(
+            "A safety-sensitive plan is waiting. Reply yes to run it, or no to cancel.",
+            started_at,
+        )
 
     async def _stream_natural_answer(
         self,
@@ -608,9 +693,7 @@ class PortableAgent:
         started_at: float,
     ) -> LLMResult:
         messages = [
-            SystemMessage(
-                content="You are Portable AI, a concise and honest local Windows assistant. Answer naturally."
-            ),
+            SystemMessage(content=SYSTEM_NATURAL_ANSWER),
             *self._recent_messages(),
             HumanMessage(content=user_text),
         ]
@@ -648,6 +731,259 @@ def build_memory_graph(checkpointer: InMemorySaver) -> Any:
     builder.add_edge(START, "remember")
     builder.add_edge("remember", END)
     return builder.compile(checkpointer=checkpointer)
+
+
+def exact_power_alias_plan(user_text: str) -> tuple[str, list[PlannedAction]] | None:
+    """Map intentionally short power aliases before the text reaches the model."""
+    command = normalized_exact_command(user_text)
+    if command in {"goodnight", "good night", "tata", "shutdown", "shut down", "turn off", "power off"}:
+        return (
+            "shutdown_cleanup",
+            [
+                PlannedAction(tool="close_all_visible_applications", arguments={}),
+                PlannedAction(tool="shutdown_computer", arguments={}),
+            ],
+        )
+    if command == "deep sleep":
+        return (
+            "deep_sleep",
+            [
+                PlannedAction(tool="close_all_visible_applications", arguments={}),
+                PlannedAction(tool="sleep_computer", arguments={}),
+            ],
+        )
+    if command in {"sleep", "normal sleep"}:
+        return "sleep_only", [PlannedAction(tool="sleep_computer", arguments={})]
+    if command in {"lock", "hide"}:
+        return "lock_only", [PlannedAction(tool="lock_computer", arguments={})]
+    return None
+
+
+def normalized_exact_command(user_text: str) -> str:
+    lowered = user_text.strip().lower()
+    without_punctuation = re.sub(r"[^a-z0-9\s]+", " ", lowered)
+    return " ".join(without_punctuation.split())
+
+
+def explicit_power_intent(user_text: str) -> Literal[
+    "shutdown", "sleep", "lock", "close_all"
+] | None:
+    """Recognize explicit commands only; questions, explanations, and negations are denied."""
+    if POWER_NEGATION_WORDS.search(user_text) or POWER_DISCUSSION_WORDS.search(user_text):
+        return None
+    if SHUTDOWN_REQUEST.search(user_text):
+        return "shutdown"
+    if SLEEP_REQUEST.search(user_text):
+        return "sleep"
+    if LOCK_REQUEST.search(user_text):
+        return "lock"
+    if CLOSE_ALL_REQUEST.search(user_text):
+        return "close_all"
+    return None
+
+
+def reconcile_power_actions(
+    user_text: str,
+    proposed: list[PlannedAction],
+) -> list[PlannedAction]:
+    """Authorize power tools from the user's text and repair their required ordering."""
+    intent = explicit_power_intent(user_text)
+    ordinary_actions = [
+        action
+        for action in proposed
+        if action.tool not in POWER_TOOLS and action.tool != "close_all_visible_applications"
+    ]
+    if intent is None:
+        return ordinary_actions
+
+    if intent == "shutdown":
+        return [
+            *ordinary_actions,
+            PlannedAction(tool="close_all_visible_applications", arguments={}),
+            PlannedAction(tool="shutdown_computer", arguments={}),
+        ]
+    if intent == "sleep":
+        close_first = bool(CLOSE_ALL_REQUEST.search(user_text))
+        return [
+            *ordinary_actions,
+            *(
+                [PlannedAction(tool="close_all_visible_applications", arguments={})]
+                if close_first
+                else []
+            ),
+            PlannedAction(tool="sleep_computer", arguments={}),
+        ]
+    if intent == "lock":
+        return [*ordinary_actions, PlannedAction(tool="lock_computer", arguments={})]
+    return [PlannedAction(tool="close_all_visible_applications", arguments={}), *ordinary_actions]
+
+
+def reconcile_notepad_actions(
+    user_text: str,
+    proposed: list[PlannedAction],
+) -> list[PlannedAction]:
+    actions = [normalize_action_arguments(action) for action in proposed]
+    mentions_notepad = bool(re.search(r"\bnote\s*pad\b", user_text, re.IGNORECASE))
+    opens_notepad = mentions_notepad and bool(OPEN_WORDS.search(user_text))
+    requested_text = extract_notepad_text(user_text)
+
+    if opens_notepad and requested_text is not None:
+        replacement = PlannedAction(tool="notepad_open", arguments={"text": requested_text})
+        replaceable = {
+            "open_application",
+            "notepad_open",
+            "open_notepad_with_text",
+            "notepad_type",
+        }
+        insertion = next(
+            (
+                index
+                for index, action in enumerate(actions)
+                if action.tool in replaceable and action_application(action) == "notepad"
+            ),
+            0,
+        )
+        actions = [
+            action
+            for action in actions
+            if not (action.tool in replaceable and action_application(action) == "notepad")
+        ]
+        actions.insert(min(insertion, len(actions)), replacement)
+
+    has_notepad_action = any(action_application(action) == "notepad" for action in actions)
+    save_requested = bool(NOTEPAD_SAVE_WORDS.search(user_text))
+    close_requested = bool(CLOSE_WORDS.search(user_text))
+    if (mentions_notepad or has_notepad_action) and save_requested and close_requested:
+        save_tools = {"notepad_save", "notepad_save_as"}
+        close_tools = {"notepad_close", "close_application"}
+        save_actions = [action for action in actions if action.tool in save_tools]
+        close_actions = [
+            action
+            for action in actions
+            if action.tool in close_tools and action_application(action) == "notepad"
+        ]
+        if not save_actions:
+            save_actions = [PlannedAction(tool="notepad_save", arguments={})]
+        if not close_actions:
+            close_actions = [PlannedAction(tool="notepad_close", arguments={})]
+        affected_indexes = [
+            index
+            for index, action in enumerate(actions)
+            if action in save_actions or action in close_actions
+        ]
+        insertion = min(affected_indexes) if affected_indexes else len(actions)
+        actions = [
+            action
+            for action in actions
+            if action not in save_actions and action not in close_actions
+        ]
+        actions[insertion:insertion] = [*save_actions, *close_actions]
+    return actions
+
+
+def extract_notepad_text(user_text: str) -> str | None:
+    write_match = NOTEPAD_WRITE_WORDS.search(user_text)
+    if write_match is None:
+        return None
+
+    quoted = re.search(r"([\"'])(?P<text>.+?)\1", user_text[write_match.end() :])
+    if quoted is not None:
+        text = quoted.group("text").strip()
+        return text or None
+
+    tail = user_text[write_match.end() :]
+    tail = re.sub(
+        r"^\s*(?:the\s+text\s*)?"
+        r"(?:(?:in|into|to)\s+(?:it|that|the\s+note|notepad|note\s*pad)\s*)?"
+        r"[,;:]?\s*",
+        "",
+        tail,
+        flags=re.IGNORECASE,
+    )
+    tail = re.split(
+        r"\s*(?:,|;)?\s*\b(?:and\s+then|then|and)\s+(?:save|close)\b",
+        tail,
+        maxsplit=1,
+        flags=re.IGNORECASE,
+    )[0]
+    text = tail.strip().strip("\"'").rstrip(".,; ")
+    return text or None
+
+
+def reconcile_file_actions(user_text: str, proposed: list[PlannedAction]) -> list[PlannedAction]:
+    rename_intent = bool(FILE_RENAME_WORDS.search(user_text))
+    copy_intent = bool(FILE_COPY_WORDS.search(user_text))
+    move_intent = bool(FILE_MOVE_WORDS.search(user_text))
+    delete_intent = bool(FILE_DELETE_WORDS.search(user_text) and explicit_file_reference(user_text))
+    allowed = {
+        "rename_file": rename_intent,
+        "copy_file": copy_intent,
+        "move_file": move_intent,
+        "delete_file": delete_intent,
+    }
+    actions = [
+        action
+        for action in proposed
+        if action.tool not in allowed or allowed[action.tool]
+    ]
+    overwrite_allowed = bool(FILE_OVERWRITE_WORDS.search(user_text))
+    actions = [enforce_file_overwrite_intent(action, overwrite_allowed) for action in actions]
+
+    required_rename = explicit_rename_file_action(user_text) if rename_intent else None
+    if required_rename is not None:
+        first_rename = next(
+            (index for index, action in enumerate(actions) if action.tool == "rename_file"),
+            len(actions),
+        )
+        actions = [action for action in actions if action.tool != "rename_file"]
+        actions.insert(first_rename, required_rename)
+    return actions
+
+
+def explicit_file_reference(user_text: str) -> bool:
+    names_directory_only = bool(
+        re.search(r"\b(?:folder|directory)\b", user_text, re.IGNORECASE)
+        and not re.search(r"\bfile\b", user_text, re.IGNORECASE)
+    )
+    if names_directory_only:
+        return False
+    return bool(
+        re.search(r"\bfiles?\b", user_text, re.IGNORECASE)
+        or re.search(r"[a-zA-Z]:[\\/]", user_text)
+        or re.search(r"\b[^\s\\/]+\.[a-zA-Z0-9]{1,10}\b", user_text)
+    )
+
+
+def enforce_file_overwrite_intent(
+    action: PlannedAction,
+    overwrite_allowed: bool,
+) -> PlannedAction:
+    if action.tool not in {"rename_file", "copy_file", "move_file"}:
+        return action
+    arguments = dict(action.arguments)
+    arguments["overwrite"] = bool(arguments.get("overwrite")) and overwrite_allowed
+    return PlannedAction(tool=action.tool, arguments=arguments)
+
+
+def explicit_rename_file_action(user_text: str) -> PlannedAction | None:
+    quoted_path = re.search(r"[\"'](?P<path>[a-zA-Z]:[\\/][^\"']+)[\"']", user_text)
+    if quoted_path is None:
+        return None
+    target = re.search(
+        r"\b(?:as|to)\s+(?:the\s+)?(?P<name>[\"']?[^\"']+?[\"']?)"
+        r"(?:\s+(?:and|then)\b.*)?[.!]?\s*$",
+        user_text[quoted_path.end() :],
+        re.IGNORECASE,
+    )
+    if target is None:
+        return None
+    new_name = target.group("name").strip().strip("\"'").rstrip(".,; ")
+    if not new_name:
+        return None
+    return PlannedAction(
+        tool="rename_file",
+        arguments={"path": quoted_path.group("path"), "new_name": new_name, "overwrite": False},
+    )
 
 
 def reconcile_directory_actions(
@@ -1103,7 +1439,7 @@ def confirmation_answer(text: str) -> bool | None:
     normalized = " ".join(text.strip().lower().split())
     if normalized in {"y", "yes", "yes please", "confirm", "proceed", "do it"}:
         return True
-    if normalized in {"n", "no", "no thanks", "cancel", "stop", "do not"}:
+    if normalized in {"n", "no", "no thanks", "cancel", "/cancel", "stop", "do not"}:
         return False
     return None
 
@@ -1114,15 +1450,24 @@ def confirmation_prompt(actions: list[PlannedAction]) -> str:
     return f"Did you mean: {joined}? Reply yes to run it, or no to cancel."
 
 
-def requires_confirmation(actions: list[PlannedAction]) -> bool:
-    return any(action.tool in CONFIRMATION_REQUIRED_TOOLS for action in actions)
+def requires_confirmation(
+    actions: list[PlannedAction],
+    source: str = "llm",
+    intent: str = "tool_request",
+) -> bool:
+    if any(action.tool in CONFIRMATION_REQUIRED_TOOLS for action in actions):
+        return True
+    if any(action.tool == "sleep_computer" for action in actions):
+        return not (source == "exact_alias" and intent == "sleep_only")
+    return False
 
 
 def destructive_confirmation_prompt(actions: list[PlannedAction]) -> str:
+    deletion_actions = [
+        action for action in actions if action.tool in {"delete_directory", "delete_file"}
+    ]
     deletion_paths = [
-        str(action.arguments.get("path") or "the requested directory")
-        for action in actions
-        if action.tool == "delete_directory"
+        str(action.arguments.get("path") or "the requested item") for action in deletion_actions
     ]
     targets = ", ".join(deletion_paths)
     plan_note = (
@@ -1130,11 +1475,35 @@ def destructive_confirmation_prompt(actions: list[PlannedAction]) -> str:
         if len(actions) > 1
         else ""
     )
-    noun = "them" if len(deletion_paths) > 1 else "it"
-    return (
-        f"This will permanently delete {targets} and everything inside {noun}."
-        f"{plan_note} Reply yes to continue, or no to cancel."
-    )
+    includes_directory = any(action.tool == "delete_directory" for action in deletion_actions)
+    directory_note = " Directory deletion also removes everything inside." if includes_directory else ""
+    return f"This will permanently delete {targets}.{directory_note}{plan_note} Reply yes to continue, or no to cancel."
+
+
+def safety_confirmation_prompt(actions: list[PlannedAction], intent: str) -> str:
+    tools = {action.tool for action in actions}
+    if "shutdown_computer" in tools:
+        return (
+            "This will gracefully close all visible applications and then shut down the laptop. "
+            "If any application remains open, shutdown will be cancelled. "
+            "Reply yes to continue, or no to cancel."
+        )
+    if "sleep_computer" in tools and "close_all_visible_applications" in tools:
+        return (
+            "This will gracefully close all visible applications and then put the laptop to sleep. "
+            "If any application remains open, sleep will be cancelled. "
+            "Reply yes to continue, or no to cancel."
+        )
+    if "close_all_visible_applications" in tools:
+        return (
+            "This will ask every visible application to close. Unsaved applications may remain open "
+            "and will not be forced. Reply yes to continue, or no to cancel."
+        )
+    if "sleep_computer" in tools:
+        return "This will put the laptop to sleep. Reply yes to continue, or no to cancel."
+    if tools.intersection({"delete_directory", "delete_file"}):
+        return destructive_confirmation_prompt(actions)
+    return confirmation_prompt(actions)
 
 
 def describe_action(action: PlannedAction) -> str:
@@ -1143,6 +1512,7 @@ def describe_action(action: PlannedAction) -> str:
         or action.arguments.get("url")
         or action.arguments.get("filename")
         or action.arguments.get("path")
+        or action.arguments.get("source")
     )
     if target:
         return f"{action.tool.replace('_', ' ')} {target}"
@@ -1177,6 +1547,34 @@ def summarize_tool_result(item: dict[str, Any]) -> str:
             return f"I closed {closed} visible {app} window{'s' if closed != 1 else ''}."
         remaining = result.get("remaining")
         return f"I could not close every {app} window; remaining: {remaining}."
+
+    if tool_name == "close_all_visible_applications":
+        closed = int(result.get("closed") or 0)
+        targeted = int(result.get("targeted") or 0)
+        remaining = result.get("remaining") if isinstance(result.get("remaining"), list) else []
+        if item.get("ok"):
+            if targeted == 0:
+                return "No other visible applications were open."
+            return f"I closed {closed} visible application window{'s' if closed != 1 else ''}."
+        titles = [str(window.get("title") or "untitled") for window in remaining if isinstance(window, dict)]
+        detail = ", ".join(titles[:5]) or str(result.get("message") or "unknown windows")
+        return f"I could not close every visible application; still open: {detail}."
+
+    if tool_name == "sleep_computer":
+        if item.get("ok"):
+            return "The computer resumed from sleep."
+        return "Windows did not enter sleep mode."
+
+    if tool_name == "lock_computer":
+        return "I locked Windows." if item.get("ok") else "Windows did not accept the lock request."
+
+    if tool_name == "shutdown_computer":
+        if item.get("ok") and result.get("dispatched"):
+            delay = int(result.get("delay_seconds") or 0)
+            if delay > 0:
+                return f"Shutdown is scheduled in {delay} seconds."
+            return "Windows accepted the shutdown request."
+        return "Windows did not accept the shutdown request."
 
     if tool_name == "list_application_windows":
         app = display_application(str(result.get("application") or "application"))
@@ -1237,6 +1635,29 @@ def summarize_tool_result(item: dict[str, Any]) -> str:
         files = int(result.get("deleted_files") or 0)
         directories = int(result.get("deleted_directories") or 0)
         return f"I permanently deleted {path} ({directories} directories and {files} files)."
+
+    if tool_name == "rename_file":
+        source = str(result.get("source") or "the requested file")
+        path = str(result.get("path") or "the requested filename")
+        if not item.get("ok"):
+            return f"I could not rename {source}."
+        if result.get("renamed") is False:
+            return f"The file already has the requested name: {path}."
+        return f"I renamed {source} to {path}."
+
+    if tool_name == "copy_file":
+        source = str(result.get("source") or "the requested file")
+        path = str(result.get("path") or "the destination")
+        return f"I copied {source} to {path}." if item.get("ok") else f"I could not copy {source}."
+
+    if tool_name == "move_file":
+        source = str(result.get("source") or "the requested file")
+        path = str(result.get("path") or "the destination")
+        return f"I moved {source} to {path}." if item.get("ok") else f"I could not move {source}."
+
+    if tool_name == "delete_file":
+        path = str(result.get("path") or "the requested file")
+        return f"I permanently deleted {path}." if item.get("ok") else f"I could not delete {path}."
 
     if tool_name == "list_directory":
         path = str(result.get("relative_path") or result.get("path") or ".")

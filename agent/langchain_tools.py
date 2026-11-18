@@ -9,9 +9,13 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 import windows_tools
 from security import (
     resolve_managed_directory,
+    resolve_managed_file,
+    resolve_managed_file_destination,
     resolve_inspection_directory,
     validate_clipboard_text,
     validate_directory_path,
+    validate_file_name,
+    validate_file_path,
     validate_notepad_filename,
     validate_notepad_text,
     validate_url,
@@ -171,6 +175,67 @@ class SummarizeDirectoryInput(InspectionDirectoryPathInput):
     pass
 
 
+class ManagedFilePathInput(ToolInput):
+    path: str = Field(
+        description=(
+            "Exact existing file path inside the PortableAI workspace or managed Notepad folder. "
+            "Relative paths are based in the workspace."
+        )
+    )
+
+    @field_validator("path")
+    @classmethod
+    def validate_path(cls, value: str) -> str:
+        cleaned = _as_value_error(validate_file_path, value)
+        _as_value_error(lambda path: str(resolve_managed_file(path)), cleaned)
+        return cleaned
+
+
+class RenameFileInput(ManagedFilePathInput):
+    new_name: str = Field(
+        description="New simple filename only, without a directory. The current extension is kept if omitted."
+    )
+    overwrite: bool = Field(
+        default=False,
+        description="Set true only when the user explicitly asks to replace an existing destination file.",
+    )
+
+    @field_validator("new_name")
+    @classmethod
+    def validate_new_name(cls, value: str) -> str:
+        return _as_value_error(validate_file_name, value)
+
+
+class TransferFileInput(ToolInput):
+    source: str = Field(
+        description="Exact existing source file in the PortableAI workspace or managed Notepad folder."
+    )
+    destination: str = Field(
+        description=(
+            "Exact destination filename or existing destination directory in a managed folder. "
+            "Relative paths are based in the workspace."
+        )
+    )
+    overwrite: bool = Field(
+        default=False,
+        description="Set true only when the user explicitly asks to replace an existing destination file.",
+    )
+
+    @field_validator("source")
+    @classmethod
+    def validate_source(cls, value: str) -> str:
+        cleaned = _as_value_error(validate_file_path, value)
+        _as_value_error(lambda path: str(resolve_managed_file(path)), cleaned)
+        return cleaned
+
+    @field_validator("destination")
+    @classmethod
+    def validate_destination(cls, value: str) -> str:
+        cleaned = _as_value_error(validate_file_path, value)
+        _as_value_error(lambda path: str(resolve_managed_file_destination(path)), cleaned)
+        return cleaned
+
+
 def _as_value_error(validator: Any, value: str) -> str:
     try:
         return validator(value)
@@ -194,6 +259,30 @@ def close_application(application: ApplicationName) -> dict[str, Any]:
 def list_application_windows(application: ApplicationName) -> dict[str, Any]:
     """List visible windows for exactly one allowlisted application."""
     return windows_tools.list_application_windows(application)
+
+
+@tool(args_schema=EmptyInput)
+def close_all_visible_applications() -> dict[str, Any]:
+    """Gracefully close all visible user applications except Sentry and essential Windows shell windows."""
+    return windows_tools.close_all_visible_applications()
+
+
+@tool(args_schema=EmptyInput)
+def sleep_computer() -> dict[str, Any]:
+    """Put the Windows computer to sleep without closing applications."""
+    return windows_tools.sleep_computer()
+
+
+@tool(args_schema=EmptyInput)
+def shutdown_computer() -> dict[str, Any]:
+    """Request the approved non-forced Windows shutdown as the final action in a validated plan."""
+    return windows_tools.shutdown_computer()
+
+
+@tool(args_schema=EmptyInput)
+def lock_computer() -> dict[str, Any]:
+    """Lock the Windows workstation without closing applications."""
+    return windows_tools.lock_computer()
 
 
 @tool(args_schema=OptionalNotepadTextInput)
@@ -303,10 +392,38 @@ def summarize_directory(path: str = ".") -> dict[str, Any]:
     return windows_tools.summarize_directory(path)
 
 
+@tool(args_schema=RenameFileInput)
+def rename_file(path: str, new_name: str, overwrite: bool = False) -> dict[str, Any]:
+    """Rename one managed file in place. Never use for moving a file to another directory."""
+    return windows_tools.rename_file(path, new_name, overwrite)
+
+
+@tool(args_schema=TransferFileInput)
+def copy_file(source: str, destination: str, overwrite: bool = False) -> dict[str, Any]:
+    """Copy one managed file. The original remains at the source path."""
+    return windows_tools.copy_file(source, destination, overwrite)
+
+
+@tool(args_schema=TransferFileInput)
+def move_file(source: str, destination: str, overwrite: bool = False) -> dict[str, Any]:
+    """Move or cut one managed file to another managed path."""
+    return windows_tools.move_file(source, destination, overwrite)
+
+
+@tool(args_schema=ManagedFilePathInput)
+def delete_file(path: str) -> dict[str, Any]:
+    """Permanently delete one managed file. The host must obtain user confirmation first."""
+    return windows_tools.delete_file(path)
+
+
 LANGCHAIN_TOOLS: list[BaseTool] = [
     open_application,
     close_application,
     list_application_windows,
+    close_all_visible_applications,
+    sleep_computer,
+    shutdown_computer,
+    lock_computer,
     notepad_open,
     open_notepad_with_text,
     notepad_type,
@@ -324,6 +441,10 @@ LANGCHAIN_TOOLS: list[BaseTool] = [
     delete_directory,
     list_directory,
     summarize_directory,
+    rename_file,
+    copy_file,
+    move_file,
+    delete_file,
 ]
 
 TOOL_REGISTRY: dict[str, BaseTool] = {item.name: item for item in LANGCHAIN_TOOLS}

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ctypes
 import html
 import json
 import platform
@@ -28,9 +29,12 @@ from config import CACHE_DIR, CLIPBOARD_READ_LIMIT, DIRECTORY_LIST_LIMIT, DIRECT
 from security import (
     managed_workspace_root,
     resolve_inspection_directory,
+    resolve_managed_file,
+    resolve_managed_file_destination,
     resolve_managed_directory,
     validate_allowed_application,
     validate_clipboard_text,
+    validate_file_name,
     validate_notepad_filename,
     validate_notepad_text,
     validate_url,
@@ -39,6 +43,44 @@ from security import (
 
 _NOTEPAD_PIDS: set[int] = set()
 _CURRENT_NOTEPAD_FILE = CACHE_DIR / "notepad" / "portable_ai_current_note.txt"
+_ACTIVE_NOTEPAD_FILE = _CURRENT_NOTEPAD_FILE
+_SENTRY_WINDOW_HANDLE: int | None = None
+_SENTRY_WINDOW_TITLE: str | None = None
+_SENTRY_WINDOW_HANDLES: set[int] = set()
+_SENTRY_HOST_PID: int | None = None
+_PROTECTED_WINDOW_CLASSES = {
+    "progman",
+    "workerw",
+    "shell_traywnd",
+    "shell_secondarytraywnd",
+    "dv2controlhost",
+}
+_PROTECTED_SHELL_PROCESSES = {
+    "searchapp.exe",
+    "searchhost.exe",
+    "shellexperiencehost.exe",
+    "startmenuexperiencehost.exe",
+    "textinputhost.exe",
+}
+_TERMINAL_HOST_PROCESSES = {
+    "alacritty.exe",
+    "code.exe",
+    "cmd.exe",
+    "conhost.exe",
+    "cursor.exe",
+    "idea64.exe",
+    "mintty.exe",
+    "openconsole.exe",
+    "powershell.exe",
+    "powershell_ise.exe",
+    "pwsh.exe",
+    "pycharm64.exe",
+    "tabby.exe",
+    "termius.exe",
+    "wezterm-gui.exe",
+    "windowsterminal.exe",
+    "wt.exe",
+}
 _APPLICATION_SHELL_IDS: dict[str, str] = {
     "notion.exe": "com.electron.notion",
     "code.exe": "Microsoft.VisualStudioCode",
@@ -47,6 +89,326 @@ _APPLICATION_SHELL_IDS: dict[str, str] = {
     "mongodbcompass.exe": "com.squirrel.MongoDBCompass.MongoDBCompass",
     "termius.exe": "com.termius.mac",
 }
+
+
+def initialize_sentry_window() -> dict[str, Any]:
+    """Give the agent terminal a unique title and capture its top-level window handle."""
+    global _SENTRY_HOST_PID, _SENTRY_WINDOW_HANDLE, _SENTRY_WINDOW_HANDLES, _SENTRY_WINDOW_TITLE
+
+    title = f"SENTRY Portable AI [{os.getpid()}]"
+    kernel32 = ctypes.windll.kernel32
+    foreground_handle = int(win32gui.GetForegroundWindow() or 0)
+    kernel32.SetConsoleTitleW(title)
+
+    console_handle = int(kernel32.GetConsoleWindow() or 0)
+    console_root = top_level_window_handle(console_handle)
+    titled_handle = find_visible_window_by_title(title)
+    if titled_handle is None:
+        deadline = time.monotonic() + 1.0
+        while titled_handle is None and time.monotonic() < deadline:
+            titled_handle = find_visible_window_by_title(title)
+            if titled_handle is None:
+                time.sleep(0.05)
+
+    top_level_handles = visible_top_level_window_handles()
+    console_candidate = console_root if console_root in top_level_handles else 0
+    foreground_candidate = (
+        foreground_handle
+        if foreground_handle in top_level_handles and is_likely_terminal_host(foreground_handle, title)
+        else 0
+    )
+    candidates = [titled_handle or 0, console_candidate, foreground_candidate]
+    handle = next(
+        (
+            candidate
+            for candidate in candidates
+            if candidate and win32gui.IsWindow(candidate) and win32gui.IsWindowVisible(candidate)
+        ),
+        0,
+    )
+
+    _SENTRY_WINDOW_TITLE = title
+    _SENTRY_WINDOW_HANDLE = handle or None
+    _SENTRY_WINDOW_HANDLES = related_window_handles(handle)
+    if console_handle:
+        _SENTRY_WINDOW_HANDLES.update(related_window_handles(console_handle))
+    _SENTRY_HOST_PID = window_process_id(handle) if handle else None
+    host_title = win32gui.GetWindowText(handle).strip() if handle else ""
+    host_process = window_process_name(_SENTRY_HOST_PID) if _SENTRY_HOST_PID else "unknown"
+    return {
+        "ok": _SENTRY_WINDOW_HANDLE is not None,
+        "hwnd": _SENTRY_WINDOW_HANDLE,
+        "title": title,
+        "host_title": host_title,
+        "host_process": host_process,
+        "protected_handles": sorted(_SENTRY_WINDOW_HANDLES),
+        "message": (
+            f"Sentry terminal protected: {host_title or host_process}."
+            if _SENTRY_WINDOW_HANDLE is not None
+            else "The Sentry terminal window could not be identified."
+        ),
+    }
+
+
+def find_visible_window_by_title(title: str) -> int | None:
+    matches: list[int] = []
+
+    def callback(hwnd: int, _: object) -> bool:
+        window_title = win32gui.GetWindowText(hwnd).strip()
+        if win32gui.IsWindowVisible(hwnd) and title in window_title:
+            matches.append(hwnd)
+        return True
+
+    win32gui.EnumWindows(callback, None)
+    return matches[0] if matches else None
+
+
+def visible_top_level_window_handles() -> set[int]:
+    handles: set[int] = set()
+
+    def callback(hwnd: int, _: object) -> bool:
+        if win32gui.IsWindowVisible(hwnd):
+            handles.add(int(hwnd))
+        return True
+
+    win32gui.EnumWindows(callback, None)
+    return handles
+
+
+def is_likely_terminal_host(hwnd: int, sentry_title: str) -> bool:
+    if not hwnd:
+        return False
+    title = win32gui.GetWindowText(hwnd).strip()
+    if sentry_title and sentry_title in title:
+        return True
+    process_name = window_process_name(window_process_id(hwnd))
+    if process_name in _TERMINAL_HOST_PROCESSES:
+        return True
+    try:
+        class_name = win32gui.GetClassName(hwnd).lower()
+    except Exception:
+        class_name = ""
+    return class_name in {"consolewindowclass", "cascadia_hosting_window_class"}
+
+
+def top_level_window_handle(hwnd: int) -> int:
+    if not hwnd:
+        return 0
+    try:
+        root = int(win32gui.GetAncestor(hwnd, getattr(win32con, "GA_ROOT", 2)) or 0)
+    except Exception:
+        root = 0
+    return root or hwnd
+
+
+def related_window_handles(hwnd: int) -> set[int]:
+    if not hwnd:
+        return set()
+    handles = {hwnd, top_level_window_handle(hwnd)}
+    current = top_level_window_handle(hwnd)
+    while current:
+        try:
+            owner = int(win32gui.GetWindow(current, win32con.GW_OWNER) or 0)
+        except Exception:
+            owner = 0
+        if not owner or owner in handles:
+            break
+        handles.add(owner)
+        handles.add(top_level_window_handle(owner))
+        current = owner
+    return {handle for handle in handles if handle}
+
+
+def window_process_id(hwnd: int) -> int | None:
+    if not hwnd:
+        return None
+    try:
+        _, pid = win32process.GetWindowThreadProcessId(hwnd)
+        return int(pid) or None
+    except Exception:
+        return None
+
+
+def window_process_name(pid: int | None) -> str:
+    if pid is None:
+        return "unknown"
+    try:
+        return psutil.Process(pid).name().lower()
+    except (psutil.AccessDenied, psutil.NoSuchProcess):
+        return "unknown"
+
+
+def is_sentry_window(hwnd: int, title: str = "") -> bool:
+    if hwnd in _SENTRY_WINDOW_HANDLES or top_level_window_handle(hwnd) in _SENTRY_WINDOW_HANDLES:
+        return True
+    return bool(_SENTRY_WINDOW_TITLE and _SENTRY_WINDOW_TITLE in title)
+
+
+def close_all_visible_applications() -> dict[str, Any]:
+    """Gracefully close every visible user application except Sentry and shell windows."""
+    if _SENTRY_WINDOW_HANDLE is None or not win32gui.IsWindow(_SENTRY_WINDOW_HANDLE):
+        return {
+            "ok": False,
+            "targeted": 0,
+            "closed": 0,
+            "remaining": [],
+            "skipped": [],
+            "message": "Sentry could not safely identify its own terminal window, so nothing was closed.",
+        }
+
+    remaining, skipped = visible_user_application_windows()
+    if not any(window.get("reason") == "sentry" for window in skipped):
+        return {
+            "ok": False,
+            "targeted": 0,
+            "closed": 0,
+            "remaining": [],
+            "skipped": [window_summary(window) for window in skipped],
+            "message": (
+                "Sentry could not verify its visible terminal in the protected window set, "
+                "so nothing was closed."
+            ),
+        }
+
+    targeted_by_handle: dict[int, dict[str, Any]] = {}
+    skipped_by_handle: dict[int, dict[str, Any]] = {
+        int(window["hwnd"]): window for window in skipped
+    }
+    deadline = time.monotonic() + 6.0
+    while time.monotonic() < deadline:
+        for window in remaining:
+            hwnd = int(window["hwnd"])
+            if hwnd in targeted_by_handle:
+                continue
+            targeted_by_handle[hwnd] = window
+            win32gui.PostMessage(hwnd, win32con.WM_CLOSE, 0, 0)
+        if not remaining:
+            break
+        time.sleep(0.10)
+        remaining, skipped = visible_user_application_windows()
+        for window in skipped:
+            skipped_by_handle[int(window["hwnd"])] = window
+
+    remaining, skipped = visible_user_application_windows()
+    for window in skipped:
+        skipped_by_handle[int(window["hwnd"])] = window
+    remaining_handles = {int(window["hwnd"]) for window in remaining}
+    closed = len(set(targeted_by_handle) - remaining_handles)
+    safe_remaining = [window_summary(window) for window in remaining]
+    return {
+        "ok": not safe_remaining,
+        "targeted": len(targeted_by_handle),
+        "closed": closed,
+        "remaining": safe_remaining,
+        "skipped": [window_summary(window) for window in skipped_by_handle.values()],
+        "message": (
+            "All visible user applications closed."
+            if not safe_remaining
+            else "Some applications are still open, possibly because they need user attention."
+        ),
+    }
+
+
+def visible_user_application_windows() -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    targets: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+
+    def callback(hwnd: int, _: object) -> bool:
+        if not win32gui.IsWindowVisible(hwnd):
+            return True
+        title = win32gui.GetWindowText(hwnd).strip()
+        if not title:
+            return True
+        pid = window_process_id(hwnd) or 0
+        process_name = window_process_name(pid)
+        try:
+            class_name = win32gui.GetClassName(hwnd).lower()
+        except Exception:
+            class_name = ""
+        window = {
+            "hwnd": hwnd,
+            "pid": pid,
+            "process": process_name,
+            "title": title,
+            "class_name": class_name,
+        }
+        if is_sentry_window(hwnd, title) or pid == os.getpid():
+            window["reason"] = "sentry"
+            skipped.append(window)
+        elif class_name in _PROTECTED_WINDOW_CLASSES or process_name in _PROTECTED_SHELL_PROCESSES:
+            window["reason"] = "windows_shell"
+            skipped.append(window)
+        else:
+            targets.append(window)
+        return True
+
+    win32gui.EnumWindows(callback, None)
+    return targets, skipped
+
+
+def window_summary(window: dict[str, Any]) -> dict[str, Any]:
+    summary = {
+        "pid": int(window.get("pid") or 0),
+        "process": str(window.get("process") or "unknown"),
+        "title": str(window.get("title") or "untitled"),
+    }
+    if window.get("reason"):
+        summary["reason"] = str(window["reason"])
+    return summary
+
+
+def sleep_computer() -> dict[str, Any]:
+    """Suspend Windows without forcing applications to close."""
+    set_suspend_state = ctypes.windll.powrprof.SetSuspendState
+    set_suspend_state.argtypes = [ctypes.c_bool, ctypes.c_bool, ctypes.c_bool]
+    set_suspend_state.restype = ctypes.c_bool
+    success = bool(set_suspend_state(False, False, False))
+    return {
+        "ok": success,
+        "state": "resumed" if success else "sleep_failed",
+        "message": "The computer resumed from sleep." if success else "Windows did not enter sleep mode.",
+    }
+
+
+def lock_computer() -> dict[str, Any]:
+    """Lock the current Windows workstation without closing applications."""
+    success = bool(ctypes.windll.user32.LockWorkStation())
+    return {
+        "ok": success,
+        "state": "locked" if success else "lock_failed",
+        "message": "Windows was locked." if success else "Windows did not accept the lock request.",
+    }
+
+
+def shutdown_computer() -> dict[str, Any]:
+    """Request a graceful Windows shutdown without an implied force flag."""
+    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    completed = subprocess.run(
+        [
+            "shutdown.exe",
+            "/s",
+            "/t",
+            "0",
+            "/c",
+            "Sentry completed the approved shutdown routine.",
+        ],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        creationflags=creationflags,
+        check=False,
+    )
+    success = completed.returncode == 0
+    return {
+        "ok": success,
+        "dispatched": success,
+        "delay_seconds": 0,
+        "message": (
+            "Windows accepted the shutdown request."
+            if success
+            else f"Windows rejected the shutdown request with exit code {completed.returncode}."
+        ),
+    }
 
 
 def open_application(application: str) -> dict[str, Any]:
@@ -164,6 +526,7 @@ def open_notepad_with_text(text: str) -> dict[str, Any]:
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     note_path = note_dir / f"portable_ai_note_{stamp}.txt"
     note_path.write_text(safe_text, encoding="utf-8")
+    set_active_notepad_file(note_path)
 
     process = launch_notepad_file(note_path)
     return {
@@ -222,6 +585,7 @@ def notepad_save_as(filename: str) -> dict[str, Any]:
     note_path = ensure_current_notepad_file()
     target_path = note_path.parent / safe_filename
     target_path.write_text(note_path.read_text(encoding="utf-8"), encoding="utf-8")
+    set_active_notepad_file(target_path)
     return {
         "ok": True,
         "path": str(target_path),
@@ -233,6 +597,79 @@ def notepad_save_as(filename: str) -> dict[str, Any]:
 def notepad_close() -> dict[str, Any]:
     """Close visible allowlisted Notepad windows."""
     return close_application("notepad")
+
+
+def rename_file(path: str, new_name: str, overwrite: bool = False) -> dict[str, Any]:
+    """Rename one file within a managed folder without changing its directory."""
+    source = resolve_managed_file(path)
+    safe_name = validate_file_name(new_name, default_suffix=source.suffix)
+    destination = resolve_managed_file(str(source.with_name(safe_name)), must_exist=False)
+    if source == destination:
+        return {
+            "ok": True,
+            "source": str(source),
+            "path": str(destination),
+            "renamed": False,
+            "message": "The file already has the requested name.",
+        }
+    prepare_file_destination(destination, overwrite)
+    source.replace(destination)
+    update_active_notepad_after_move(source, destination)
+    return {
+        "ok": True,
+        "source": str(source),
+        "path": str(destination),
+        "renamed": True,
+        "message": "File renamed.",
+    }
+
+
+def copy_file(source: str, destination: str, overwrite: bool = False) -> dict[str, Any]:
+    """Copy one file between managed folders, preserving its metadata."""
+    source_path = resolve_managed_file(source)
+    destination_path = resolve_file_destination(destination, source_path)
+    if source_path == destination_path:
+        raise ToolError("Source and destination refer to the same file.")
+    prepare_file_destination(destination_path, overwrite)
+    shutil.copy2(source_path, destination_path)
+    return {
+        "ok": True,
+        "source": str(source_path),
+        "path": str(destination_path),
+        "bytes": destination_path.stat().st_size,
+        "message": "File copied.",
+    }
+
+
+def move_file(source: str, destination: str, overwrite: bool = False) -> dict[str, Any]:
+    """Move or cut one file between managed folders."""
+    source_path = resolve_managed_file(source)
+    destination_path = resolve_file_destination(destination, source_path)
+    if source_path == destination_path:
+        raise ToolError("Source and destination refer to the same file.")
+    prepare_file_destination(destination_path, overwrite)
+    shutil.move(str(source_path), str(destination_path))
+    update_active_notepad_after_move(source_path, destination_path)
+    return {
+        "ok": True,
+        "source": str(source_path),
+        "path": str(destination_path),
+        "message": "File moved.",
+    }
+
+
+def delete_file(path: str) -> dict[str, Any]:
+    """Permanently delete one file in a managed folder after host confirmation."""
+    target = resolve_managed_file(path)
+    size = target.stat().st_size
+    target.unlink()
+    reset_active_notepad_after_delete(target)
+    return {
+        "ok": True,
+        "path": str(target),
+        "deleted_bytes": size,
+        "message": "File permanently deleted.",
+    }
 
 
 def create_directory(path: str) -> dict[str, Any]:
@@ -451,11 +888,40 @@ def close_active_notepad_sessions() -> dict[str, Any]:
 
 
 def ensure_current_notepad_file() -> Path:
-    note_dir = _CURRENT_NOTEPAD_FILE.parent
+    note_path = _ACTIVE_NOTEPAD_FILE
+    note_dir = note_path.parent
     note_dir.mkdir(parents=True, exist_ok=True)
-    if not _CURRENT_NOTEPAD_FILE.exists():
-        _CURRENT_NOTEPAD_FILE.write_text("", encoding="utf-8")
-    return _CURRENT_NOTEPAD_FILE
+    if not note_path.exists():
+        note_path.write_text("", encoding="utf-8")
+    return note_path
+
+
+def set_active_notepad_file(path: Path) -> None:
+    global _ACTIVE_NOTEPAD_FILE
+    _ACTIVE_NOTEPAD_FILE = path.resolve(strict=False)
+
+
+def update_active_notepad_after_move(source: Path, destination: Path) -> None:
+    if source.resolve(strict=False) == _ACTIVE_NOTEPAD_FILE.resolve(strict=False):
+        set_active_notepad_file(destination)
+
+
+def reset_active_notepad_after_delete(path: Path) -> None:
+    global _ACTIVE_NOTEPAD_FILE
+    if path.resolve(strict=False) == _ACTIVE_NOTEPAD_FILE.resolve(strict=False):
+        _ACTIVE_NOTEPAD_FILE = _CURRENT_NOTEPAD_FILE
+
+
+def resolve_file_destination(destination: str, source: Path) -> Path:
+    return resolve_managed_file_destination(destination, source_name=source.name)
+
+
+def prepare_file_destination(path: Path, overwrite: bool) -> None:
+    if not path.exists():
+        return
+    if not overwrite:
+        raise ToolError(f"Destination file already exists: {path}")
+    path.unlink()
 
 
 def launch_notepad_file(path: Path) -> subprocess.Popen[bytes]:

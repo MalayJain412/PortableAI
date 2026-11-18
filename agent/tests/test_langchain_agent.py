@@ -4,6 +4,7 @@ import json
 import unittest
 from collections.abc import AsyncIterator
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any
 from unittest.mock import patch
 
@@ -11,6 +12,7 @@ from langchain_core.messages import AIMessage, AIMessageChunk, SystemMessage
 
 from agent import PortableAgent
 from langchain_tools import TOOL_REGISTRY
+from plan_store import PlanStore
 
 
 class FakeChatModel:
@@ -816,6 +818,300 @@ class PortableAgentToolCallingTests(unittest.IsolatedAsyncioTestCase):
     def test_directory_schema_blocks_workspace_root_deletion(self) -> None:
         with self.assertRaises(Exception):
             TOOL_REGISTRY["delete_directory"].invoke({"path": "."})
+
+
+    async def test_open_notepad_with_unquoted_text_repairs_open_only_plan(self) -> None:
+        model = FakeChatModel([tool_response(("open_application", {"application": "notepad"}))])
+        agent = PortableAgent(chat_model=model, tool_calling_supported=True)
+        requested = "255 spent on the swiggy order in the stryki"
+
+        with (
+            patch(
+                "langchain_tools.windows_tools.notepad_open",
+                return_value={
+                    "ok": True,
+                    "path": "F:\\PortableAI\\cache\\notepad\\portable_ai_current_note.txt",
+                    "message": "Managed Notepad note opened.",
+                },
+            ) as notepad_open,
+            patch("langchain_tools.windows_tools.open_application") as open_application,
+        ):
+            result = await agent.handle(f"open notepad and add the text in that, {requested}")
+
+        notepad_open.assert_called_once_with(requested)
+        open_application.assert_not_called()
+        self.assertIn("portable_ai_current_note.txt", result.content)
+
+    async def test_notepad_save_is_executed_before_close(self) -> None:
+        model = FakeChatModel(
+            [tool_response(("notepad_close", {}), ("notepad_save", {}))]
+        )
+        agent = PortableAgent(chat_model=model, tool_calling_supported=True)
+        calls: list[str] = []
+
+        def fake_save() -> dict[str, Any]:
+            calls.append("save")
+            return {"ok": True, "path": "note.txt", "message": "Saved."}
+
+        def fake_close() -> dict[str, Any]:
+            calls.append("close")
+            return {
+                "ok": True,
+                "application": "notepad",
+                "closed": 1,
+                "targeted": 1,
+                "remaining": [],
+            }
+
+        with (
+            patch("langchain_tools.windows_tools.notepad_save", side_effect=fake_save),
+            patch("langchain_tools.windows_tools.notepad_close", side_effect=fake_close),
+        ):
+            await agent.handle("save the file and close notepad")
+
+        self.assertEqual(calls, ["save", "close"])
+
+    async def test_explicit_quoted_path_rename_is_repaired_when_model_refuses(self) -> None:
+        model = FakeChatModel([AIMessage(content="I cannot rename files.")])
+        agent = PortableAgent(chat_model=model, tool_calling_supported=True)
+        source = "F:\\PortableAI\\cache\\notepad\\portable_ai_current_note.txt"
+        destination = "F:\\PortableAI\\cache\\notepad\\nagpur-expenses.txt"
+
+        with (
+            patch("langchain_tools.resolve_managed_file", side_effect=lambda path: Path(path)),
+            patch(
+                "langchain_tools.windows_tools.rename_file",
+                return_value={
+                    "ok": True,
+                    "source": source,
+                    "path": destination,
+                    "renamed": True,
+                },
+            ) as rename_file,
+        ):
+            result = await agent.handle(f'"{source}" rename this as the nagpur-expenses')
+
+        rename_file.assert_called_once_with(source, "nagpur-expenses", False)
+        self.assertIn("nagpur-expenses.txt", result.content)
+
+    async def test_delete_file_requires_confirmation(self) -> None:
+        source = "F:\\PortableAI\\workspace\\old.txt"
+        model = FakeChatModel([tool_response(("delete_file", {"path": source}))])
+        agent = PortableAgent(chat_model=model, tool_calling_supported=True)
+
+        with (
+            patch("langchain_tools.resolve_managed_file", side_effect=lambda path: Path(path)),
+            patch(
+                "langchain_tools.windows_tools.delete_file",
+                return_value={"ok": True, "path": source, "deleted_bytes": 3},
+            ) as delete_file,
+        ):
+            first = await agent.handle(f'delete the file "{source}"')
+            delete_file.assert_not_called()
+            second = await agent.handle("yes")
+
+        self.assertIn("permanently delete", first.content)
+        delete_file.assert_called_once_with(source)
+        self.assertIn("permanently deleted", second.content)
+
+
+class PortableAgentPowerFlowTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        self.temporary_directory = TemporaryDirectory()
+        self.addCleanup(self.temporary_directory.cleanup)
+        self.plan_store = PlanStore(Path(self.temporary_directory.name) / "plans.db")
+
+    def make_agent(self, responses: list[AIMessage] | None = None) -> PortableAgent:
+        return PortableAgent(
+            chat_model=FakeChatModel(responses or []),
+            tool_calling_supported=True,
+            plan_store=self.plan_store,
+        )
+
+    async def test_goodnight_waits_for_confirmation_then_closes_and_shuts_down(self) -> None:
+        agent = self.make_agent()
+        calls: list[str] = []
+
+        def close_all() -> dict[str, Any]:
+            calls.append("close_all")
+            return {"ok": True, "targeted": 2, "closed": 2, "remaining": []}
+
+        def shutdown() -> dict[str, Any]:
+            calls.append("shutdown")
+            return {"ok": True, "dispatched": True, "delay_seconds": 0}
+
+        with (
+            patch("langchain_tools.windows_tools.close_all_visible_applications", side_effect=close_all),
+            patch("langchain_tools.windows_tools.shutdown_computer", side_effect=shutdown),
+        ):
+            first = await agent.handle("Good Night")
+            self.assertEqual(calls, [])
+            self.assertIn("shut down", first.content)
+            plan_id = agent.pending_confirmation.plan_id
+            second = await agent.handle("yes")
+
+        self.assertEqual(calls, ["close_all", "shutdown"])
+        self.assertTrue(agent.exit_requested)
+        self.assertIn("accepted the shutdown request", second.content)
+        stored = self.plan_store.get_plan(plan_id)
+        self.assertEqual(stored.status, "dispatched")
+        self.assertEqual([action.status for action in stored.actions], ["succeeded", "dispatched"])
+
+    async def test_tata_uses_the_same_confirmed_shutdown_routine(self) -> None:
+        agent = self.make_agent()
+
+        with (
+            patch("langchain_tools.windows_tools.close_all_visible_applications") as close_all,
+            patch("langchain_tools.windows_tools.shutdown_computer") as shutdown,
+        ):
+            result = await agent.handle("Tata!")
+
+        self.assertIn("shut down", result.content)
+        close_all.assert_not_called()
+        shutdown.assert_not_called()
+
+    async def test_deep_sleep_is_blocked_when_an_application_remains_open(self) -> None:
+        agent = self.make_agent()
+        close_result = {
+            "ok": False,
+            "targeted": 2,
+            "closed": 1,
+            "remaining": [{"title": "Unsaved - Notepad", "process": "notepad.exe", "pid": 10}],
+            "message": "Some applications are still open.",
+        }
+
+        with (
+            patch(
+                "langchain_tools.windows_tools.close_all_visible_applications",
+                return_value=close_result,
+            ),
+            patch("langchain_tools.windows_tools.sleep_computer") as sleep_computer,
+        ):
+            await agent.handle("deep sleep")
+            plan_id = agent.pending_confirmation.plan_id
+            result = await agent.handle("yes")
+
+        sleep_computer.assert_not_called()
+        self.assertIn("Unsaved - Notepad", result.content)
+        self.assertIn("Skipped", result.content)
+        stored = self.plan_store.get_plan(plan_id)
+        self.assertEqual(stored.status, "failed")
+        self.assertEqual([action.status for action in stored.actions], ["failed", "blocked"])
+
+    async def test_exact_sleep_runs_immediately_without_closing_applications(self) -> None:
+        agent = self.make_agent()
+
+        with (
+            patch("langchain_tools.windows_tools.close_all_visible_applications") as close_all,
+            patch(
+                "langchain_tools.windows_tools.sleep_computer",
+                return_value={"ok": True, "state": "resumed"},
+            ) as sleep_computer,
+        ):
+            result = await agent.handle("normal sleep")
+
+        close_all.assert_not_called()
+        sleep_computer.assert_called_once_with()
+        self.assertEqual(result.content, "The computer resumed from sleep.")
+
+    async def test_exact_hide_locks_immediately(self) -> None:
+        agent = self.make_agent()
+
+        with patch(
+            "langchain_tools.windows_tools.lock_computer",
+            return_value={"ok": True, "state": "locked"},
+        ) as lock_computer:
+            result = await agent.handle("hide")
+
+        lock_computer.assert_called_once_with()
+        self.assertEqual(result.content, "I locked Windows.")
+
+    async def test_pending_confirmation_is_not_lost_on_unrelated_reply(self) -> None:
+        agent = self.make_agent()
+
+        await agent.handle("goodnight")
+        plan_id = agent.pending_confirmation.plan_id
+        result = await agent.handle("maybe later")
+
+        self.assertIn("Reply yes", result.content)
+        self.assertEqual(agent.pending_confirmation.plan_id, plan_id)
+        self.assertEqual(self.plan_store.get_plan(plan_id).status, "pending_confirmation")
+
+    async def test_cancel_discards_the_complete_pending_plan(self) -> None:
+        agent = self.make_agent()
+
+        await agent.handle("deep sleep")
+        plan_id = agent.pending_confirmation.plan_id
+        result = await agent.handle("/cancel")
+
+        self.assertIn("cancelled", result.content)
+        self.assertIsNone(agent.pending_confirmation)
+        stored = self.plan_store.get_plan(plan_id)
+        self.assertEqual(stored.status, "cancelled")
+        self.assertEqual([action.status for action in stored.actions], ["cancelled", "cancelled"])
+
+    async def test_natural_shutdown_is_repaired_to_close_all_then_shutdown(self) -> None:
+        agent = self.make_agent([AIMessage(content="I will shut it down.")])
+        calls: list[str] = []
+
+        with (
+            patch(
+                "langchain_tools.windows_tools.close_all_visible_applications",
+                side_effect=lambda: calls.append("close_all")
+                or {"ok": True, "targeted": 0, "closed": 0, "remaining": []},
+            ),
+            patch(
+                "langchain_tools.windows_tools.shutdown_computer",
+                side_effect=lambda: calls.append("shutdown")
+                or {"ok": True, "dispatched": True, "delay_seconds": 0},
+            ),
+        ):
+            await agent.handle("please shutdown my laptop")
+            self.assertEqual(calls, [])
+            await agent.handle("yes")
+
+        self.assertEqual(calls, ["close_all", "shutdown"])
+
+    async def test_exact_shutdown_does_not_depend_on_model_planning(self) -> None:
+        agent = self.make_agent()
+
+        with (
+            patch("langchain_tools.windows_tools.close_all_visible_applications") as close_all,
+            patch("langchain_tools.windows_tools.shutdown_computer") as shutdown,
+        ):
+            result = await agent.handle("shutdown")
+
+        self.assertIn("shut down", result.content)
+        close_all.assert_not_called()
+        shutdown.assert_not_called()
+
+    async def test_negated_sleep_does_not_authorize_power_tool(self) -> None:
+        agent = self.make_agent(
+            [
+                tool_response(("sleep_computer", {})),
+                AIMessage(content="Okay, I will leave the computer awake."),
+            ]
+        )
+
+        with patch("langchain_tools.windows_tools.sleep_computer") as sleep_computer:
+            result = await agent.handle("do not sleep the computer")
+
+        sleep_computer.assert_not_called()
+        self.assertIn("awake", result.content)
+
+    async def test_power_question_does_not_authorize_power_tool(self) -> None:
+        agent = self.make_agent(
+            [
+                tool_response(("shutdown_computer", {})),
+                AIMessage(content="It depends on whether you have saved your work."),
+            ]
+        )
+
+        with patch("langchain_tools.windows_tools.shutdown_computer") as shutdown_computer:
+            result = await agent.handle("should I shutdown my laptop?")
+
+        shutdown_computer.assert_not_called()
+        self.assertIn("saved your work", result.content)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,29 @@
+Available tools (each call performs one atomic action):
+- open_application(application): open one allowlisted application.
+- close_application(application): close all visible windows of one allowlisted application.
+- list_application_windows(application): inspect current visible windows for one application.
+- close_all_visible_applications(): gracefully close every visible user application except Sentry and Windows shell windows.
+- sleep_computer(): put Windows to sleep without closing applications.
+- shutdown_computer(): request the approved non-forced Windows shutdown as the final action.
+- lock_computer(): lock Windows without closing applications.
+- open_url(url): open one explicitly requested HTTP or HTTPS destination in the default browser.
+- youtube_search_open(query): find and open one specific YouTube video, playlist, or channel.
+- open_notepad_with_text(text): create and open a one-shot Notepad note with exact text.
+- notepad_open(text): open the managed note, optionally replacing it with starting text.
+- notepad_type(text): append exact text to the managed note.
+- notepad_save(): report the managed note's current saved path.
+- notepad_save_as(filename): save the managed note under a simple filename.
+- notepad_close(): close visible Notepad windows.
+- list_processes(): list running processes.
+- system_information(): read basic local system information.
+- active_window(): inspect the current foreground window.
+- clipboard_read(): read text from the clipboard.
+- clipboard_write(text): write exact text to the clipboard.
+- create_directory(path): create a directory inside the managed PortableAI workspace.
+- delete_directory(path): permanently delete a directory tree inside the managed workspace.
+- list_directory(path, recursive, include, output_format): list entries in any existing local directory from names and metadata only.
+- summarize_directory(path): summarize any existing local directory from counts, sizes, and file types only.
+- rename_file(path, new_name, overwrite): rename one managed file without moving it.
+- copy_file(source, destination, overwrite): copy one managed file and keep the original.
+- move_file(source, destination, overwrite): move or cut one managed file.
+- delete_file(path): permanently delete one managed file after confirmation.

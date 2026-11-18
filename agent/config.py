@@ -5,8 +5,10 @@ from pathlib import Path
 
 AGENT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = AGENT_DIR.parent
+PROMPTS_DIR = AGENT_DIR / "prompts"
 LOGS_DIR = PROJECT_ROOT / "logs"
 CACHE_DIR = PROJECT_ROOT / "cache"
+AGENT_STATE_DB = CACHE_DIR / "agent_state.db"
 MODELS_DIR = PROJECT_ROOT / "models"
 WORKSPACE_DIR = PROJECT_ROOT / "workspace"
 MODEL_EXE = MODELS_DIR / "Qwen3.5-0.8B-Q8_0.exe"

@@ -6,12 +6,13 @@ from pathlib import Path
 from unittest.mock import patch
 
 import windows_tools
+from config import CACHE_DIR
 from security import validate_directory_path
 
 
 class ManagedDirectoryToolTests(unittest.TestCase):
     def setUp(self) -> None:
-        cache = Path(__file__).resolve().parent.parent / "cache"
+        cache = CACHE_DIR
         cache.mkdir(parents=True, exist_ok=True)
         self.temporary_directory = tempfile.TemporaryDirectory(dir=cache)
         self.workspace = Path(self.temporary_directory.name) / "workspace"

@@ -8,7 +8,7 @@ from urllib.parse import urlparse
 
 from mcp.server.mcpserver.exceptions import ToolError
 
-from config import ALLOWED_APPLICATIONS, NOTEPAD_TEXT_LIMIT, WORKSPACE_DIR
+from config import ALLOWED_APPLICATIONS, CACHE_DIR, NOTEPAD_TEXT_LIMIT, WORKSPACE_DIR
 
 
 APPLICATION_ALIASES = {
@@ -90,6 +90,38 @@ def validate_notepad_filename(filename: str) -> str:
     return cleaned
 
 
+def validate_file_path(path: str) -> str:
+    if not isinstance(path, str):
+        raise ToolError("File path must be a string.")
+    cleaned = path.strip().strip("\"'")
+    if not cleaned:
+        raise ToolError("File path cannot be empty.")
+    if len(cleaned) > 500:
+        raise ToolError("File path is too long.")
+    if "\x00" in cleaned or any(character in cleaned for character in "*?"):
+        raise ToolError("File paths cannot contain null bytes or wildcard characters.")
+    if cleaned.startswith(("\\\\", "//")):
+        raise ToolError("Network and device paths are not allowed.")
+    return cleaned
+
+
+def validate_file_name(filename: str, *, default_suffix: str = "") -> str:
+    if not isinstance(filename, str):
+        raise ToolError("Filename must be a string.")
+    cleaned = filename.strip().strip("\"'")
+    if not cleaned:
+        raise ToolError("Filename cannot be empty.")
+    if any(separator in cleaned for separator in ("\\", "/")) or cleaned in {".", ".."}:
+        raise ToolError("Filename must be a simple name, not a path.")
+    if any(character in cleaned for character in '<>:"/\\|?*'):
+        raise ToolError("Filename contains characters that Windows does not allow.")
+    if cleaned.endswith((" ", ".")):
+        raise ToolError("Filename cannot end with a space or period.")
+    if default_suffix and not Path(cleaned).suffix:
+        cleaned += default_suffix
+    return cleaned
+
+
 def validate_directory_path(path: str) -> str:
     if not isinstance(path, str):
         raise ToolError("Directory path must be a string.")
@@ -117,6 +149,67 @@ def managed_workspace_root() -> Path:
     root = WORKSPACE_DIR.resolve(strict=False)
     root.mkdir(parents=True, exist_ok=True)
     return root
+
+
+def managed_file_roots() -> tuple[Path, ...]:
+    workspace = managed_workspace_root()
+    notes = (CACHE_DIR / "notepad").resolve(strict=False)
+    notes.mkdir(parents=True, exist_ok=True)
+    return workspace, notes
+
+
+def resolve_managed_file(path: str, *, must_exist: bool = True) -> Path:
+    """Resolve a file confined to the workspace or managed Notepad directory."""
+    cleaned = validate_file_path(path)
+    requested = Path(cleaned)
+    if re.match(r"^[a-zA-Z]:", cleaned) and not requested.is_absolute():
+        raise ToolError("Drive paths must be absolute, for example F:\\PortableAI\\workspace\\note.txt.")
+    if not requested.is_absolute():
+        requested = managed_workspace_root() / requested
+
+    lexical = Path(os.path.abspath(requested))
+    root = _matching_managed_file_root(lexical)
+    _reject_linked_path(lexical, root)
+
+    resolved = lexical.resolve(strict=False)
+    _matching_managed_file_root(resolved)
+    if must_exist and not resolved.exists():
+        raise ToolError(f"File does not exist: {resolved}")
+    if resolved.exists() and not resolved.is_file():
+        raise ToolError(f"Path is not a file: {resolved}")
+    if not must_exist:
+        parent = resolved.parent
+        if not parent.exists() or not parent.is_dir():
+            raise ToolError(f"Destination directory does not exist: {parent}")
+        _reject_linked_path(parent, root)
+    return resolved
+
+
+def resolve_managed_file_destination(path: str, *, source_name: str | None = None) -> Path:
+    """Validate a managed transfer destination, including an existing directory target."""
+    cleaned = validate_file_path(path)
+    requested = Path(cleaned)
+    if re.match(r"^[a-zA-Z]:", cleaned) and not requested.is_absolute():
+        raise ToolError("Drive paths must be absolute, for example F:\\PortableAI\\workspace\\note.txt.")
+    if not requested.is_absolute():
+        requested = managed_workspace_root() / requested
+    if requested.exists() and requested.is_dir():
+        child_name = validate_file_name(source_name) if source_name else ".portable_ai_destination_check"
+        requested = requested / child_name
+    return resolve_managed_file(str(requested), must_exist=False)
+
+
+def _matching_managed_file_root(path: Path) -> Path:
+    for root in managed_file_roots():
+        try:
+            path.relative_to(root)
+            if path == root:
+                break
+            return root
+        except ValueError:
+            continue
+    roots = ", ".join(str(root) for root in managed_file_roots())
+    raise ToolError(f"File changes are limited to managed folders: {roots}.")
 
 
 def resolve_managed_directory(

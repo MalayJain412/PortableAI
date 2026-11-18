@@ -8,6 +8,7 @@ import time
 from agent import PortableAgent
 from llm import GenerationMetrics, LlamafileClient
 from voice import OfflineVoiceInput, VoiceConfig, VoiceUnavailableError, available_vosk_models, normalize_voice_command, resolve_vosk_model_path, voice_dependencies_status
+from windows_tools import initialize_sentry_window
 
 
 VOICE_ENABLED = False
@@ -16,6 +17,7 @@ HELP_TEXT = """Commands:
   /help     Show this help
   /tools    List available Windows tools
   /clear    Clear chat memory
+  /cancel   Cancel a pending safety-sensitive plan
   /exit     Quit
 """
 
@@ -105,6 +107,15 @@ def print_metrics(metrics: GenerationMetrics) -> None:
 
 
 async def run_chat() -> int:
+    terminal = initialize_sentry_window()
+    if not terminal["ok"]:
+        print("Warning: Sentry could not protect this terminal, so close-all routines will be blocked.")
+    else:
+        print(
+            "Terminal guard: "
+            f"{terminal.get('host_process') or 'unknown'} | "
+            f"{terminal.get('host_title') or terminal.get('title')}"
+        )
     print_banner()
     llm = LlamafileClient()
     if not llm.health():
@@ -257,6 +268,9 @@ async def run_chat() -> int:
         if result.content and not streamed:
             print(result.content, end="", flush=True)
         print_metrics(result.metrics)
+        if agent.exit_requested:
+            print("Sentry is exiting so it cannot delay shutdown.")
+            return 20
 
 
 def prepare_voice_text(spoken: str, confirm: bool) -> str:
